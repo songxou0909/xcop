@@ -1,0 +1,450 @@
+## General buttons ##
+"Change user":
+
+	Allows you to change usernames, you can have multiple usernames. For example, joey, joey1, joey2...
+ 
+	This function is intended to help you save multiple sets of your parameters (job numbers, folder names, crossovers, window sizes, theme, etc.)
+ 
+	Right-click this button allows you to set your window sizes to default
+ 
+	If username is empty, it goes to "general" user, which is a public space
+
+
+"Generate command":
+
+	Either generate a runnable command in the textbox, or open a window for further information to the function you select
+
+
+"Run":
+
+	Send the current text in the textbox as a command to cluster, each sending will be run in different shell environment. So if you want to run consecutive commands, for example, module load something and then use it, please input "ml xxx && your_command"
+
+
+"Clean":
+
+	Delete whatever text is in the textbox
+
+
+"Relion":
+
+	Open relion and run in background at the directory where you open xcop
+
+
+"Theme toggle":
+
+	Support two themes, light and dark, allows you to toggle when windows are already open
+
+
+## Separate movies ##
+
+1. Enter the folder name that contains your *.jpg files
+
+
+2. When click "Submit", the *.eer files in <Movies> that do not have the matched names in the JPG folder will be moved to <bAD mOviEs>, which is auto-generated
+  
+  The <Movies_bad> is named as <bAD mOviEs> due to an accident that richard had misdeleted all his <Movies> just after he separated his eer files
+
+
+3. In the textbox, it shows how many *.eer files are in the <Movies> initially, how many get transferred and how many are left 
+
+
+## Get movie frames ##
+
+It reads the first *.eer file in the folder <Movies>
+
+
+Use head command and reads the first 256 bytes of contents and fetch "frameID", number of frames equals to "frameID" plus 1
+
+
+The number of frames of this *.eer file will be displayed in the textbox at the main window
+
+
+## Calculate dose per frame ##
+
+Input total dose and number of frames to calculate dose per frames
+
+
+The number of frames can be retrieved in the "Get movies frames" function
+
+
+Results will be ranked with least signal loss, then biggest EER fractionation (higher dose per frame), while excluding those fall outside 0.5 ~ 1.25 dose per frame (according to the relion instructions)
+
+
+## Check topaz training ##
+
+Enter the job number of your training job
+
+
+It only reads the number in the last column
+
+
+The epoch with the highest score will be displayed in the textbox at the main window first, then list all the results
+
+
+## Build initial model ##
+
+Number of classes: 
+
+	input how many classes you selected to build the initial model
+ 
+ 
+Job number: 
+
+	the job number of your select job
+ 
+ 
+Model name: 
+
+	you can name this initial model so that it saves at the folder under your <Input folder name>
+ 
+	it reads the folder names under your <Input folder name>, you can select using the dropdown menu
+ 
+	if you choose "custom". you can put whatever name you want, and it will create a folder <custom> under your <Input folder name>
+ 
+ 
+Run number:
+
+	which round of helical reconstruction you are running
+ 
+	if it is 1, -smear 2 will be added to the command generated
+ 
+	if it is 2 or 3, --smear will be removed, and add --iniref to the command generated
+ 
+ 
+Input folder name:
+
+	the main folder containing all initial model related files, default is <iniModel>, which is a subfolder inside the parent folder
+ 
+ 
+Pixel size:
+
+	the pixel size of your extracted particles, written in relion when you do particle extraction
+ 
+ 
+Mask diameter:
+
+	literal meaning
+ 
+ 
+Max resolution:
+
+	literal meaning
+ 
+ 
+Crossover distance:
+
+	the crossover distance of your initial model
+ 
+ 
+Search angle and step angle:
+
+	literal meaning, default is 2 and 0.5 respectively
+ 
+ 
+Iteration:
+
+	can leave it blank, but if you like to modify it, it will add a --iter (..) to the command generated
+ 
+ 
+Order of symmetry:
+
+	you can impose symmetry to your initial model, can leave it blank, or a --sym (..) will be added to the command generated
+ 
+ 
+
+
+## Open xmipp ##
+"Open last run":
+
+	reads the before_projection.spi, after_projection.spi and rec.spi in the parent folder
+
+
+"Display":
+
+	display a specific run based on your chosen <Model Name> folder
+ 
+ 
+ "Scale":
+ 
+  how much you want to enlarge the image displayed by relion
+  
+ 
+ "Display with relion":
+   
+   you can use this to display your mrc file, so that you can save them as png for the purpose of making figures
+   
+   
+## Rescale final initial model ##
+
+This function is for you to quickly rescale your initial model to a box size for 3D auto-refine, and the naming system is suitable for you to remember the crossover and box size
+
+
+Input folder name:
+
+	is the folder name where you create your initial models, will be retreived from "Build initial model" so that you won't mistaken
+ 
+ 
+Model name:
+
+	reads the <folder names> under your <Input folder name>
+ 
+ 
+Pixel size:
+
+	the pixel size of your initial model
+ 
+ 
+Rescaled pixel size:
+
+	the pixel size you want to rescale to
+ 
+ 
+Box size:
+
+	the box size of your rescaled initial model
+ 
+ 
+Crossover distance:
+
+	does not affect the command running, but it modifies the name of your rescaled model so that it is easier to distinguish, e.g., ...x600.mrc
+	
+
+## Symmetry expansion ##
+
+Job number:
+
+	the job number of your input map
+ 
+ 
+pixel size:
+
+	the pixel size of yout input map
+ 
+ 
+twist:
+
+	the twist of your input map, written in relion
+ 
+ 
+rise:
+
+	the rise of your input map, written in relion
+ 
+ 
+tube diameter:
+
+	the tube diameter of your input map
+ 
+ 
+z percentage:
+
+	enter as a percentage number, e.g., 30, is the z percentage mask you used
+ 
+ 
+Output in the <FSC>/<Model Name> folder:
+
+	the symmetry expanded maps will be directly output into the <FSC>/<Model Name> folder under the parent folder, more convenient to make FSC curves; it automatically creates the folder for you if there isn't
+ 
+ 
+Copy postprocess.mrc to <FSC>/<Model Name>:
+
+	copy the postprocess.mrc to the <FSC>/<Model Name> folder for easy generation of the black.txt
+ 
+ 
+"PostprocessMap":
+
+	symmetry expand your target postprocess.mrc in <PostProcess> folder, output hh_postprocess.mrc
+ 
+ 
+"Halfmap1" and "Halfmap2":
+
+	symmetry expand your target run_half1_class001_unfil.mrc and run_half2_class001_unfil.mrc in your <Refine3D> folder
+ 
+ 
+
+## Invert handedness ##
+
+
+	it invert the handedness of your target postprocess.mrc in <PostProcess> folder
+
+## Make FSC curve ##
+!!! important: your model name folder should not contain dots, suggest to use this format: type1_jobnumber_resolution -> type1_100_250000 (no dots)
+
+"Black": 
+
+	generate black.txt from your hh_postprocess.mrc in the <FSC>/<Model Name> folder
+ 
+ 
+"Red":
+
+	"Molmap the Final model":
+ 
+		use Chimera to malmap your final model using the hh_postprocess.mrc in the <FSC>/<Model Name> folder. If your use xcop to symmetry expand, it will be here if you selected "Output in the <FSC> folder"
+   
+
+	"Create Molmap Mask":
+ 
+		literal meaning, with default parameters
+   
+   
+	"Multiply the PostProcess Map by the Mask":
+ 
+		literal meaning, to use the mask created just now
+   
+   
+	"Calculate the FSC":
+ 
+		use the files in <FSC>/<Model Name> folder to generate red.txt
+   
+   
+"Blue":
+
+	"Molmap the Final model":
+ 
+		use Chimera to malmap your ISOLDE fitted final model (No ISOLDE function in xcop) using the SymEx_haldmap1.mrc in the <FSC>/<Model Name> folder. If your use xcop to symmetry expand, it will be here if you selected "Output in the <FSC> folder"
+   
+   
+	"Create Molmap Mask":
+ 
+		literal meaning, with default parameters
+   
+   
+	"Multiply the Halfmap1 Map by the Mask":
+ 
+		literal meaning using the mask created just now
+   
+   
+	"Calculate the FSC":
+ 
+		use the files in <FSC>/<Model Name> folder to generate blue.txt 
+   
+   
+"Yellow":
+
+	"Multiply Halfmap2 by the Mask from above":
+ 
+		multiple halfmap2 using the mask created in blue
+   
+   
+	"Calculate the FSC":
+ 
+		generate yellow.txt
+   
+   
+"Visualize FSC Curves":
+
+	use the black.txt, red.txt, blue.txt and yellow.txt to plot them into one graph
+
+
+	multiple adjustments can be implemented
+ 
+ 
+  the default layout is already Ruben's on-paper graph
+  
+  
+  you can play around the functions in the plotting layout, if you want to export, the files will be exported under <FSC>/<Model Name>
+ 
+ 
+"Export a Combined txt File":
+
+	output a fsc_combined.txt in the parent folder, which contains:
+ 
+ 
+	column1 x-values of the fsc curves (retrieved from the blank curve)
+ 
+ 
+	column2 y-values of the black curve
+ 
+ 
+	column3 y-values of the red curve
+ 
+ 
+	column4 y-values of the blue curve
+ 
+ 
+	column5 y-values of the yellow curve
+ 
+ 
+	you can drag this into Excel to make your own graph
+ 
+ 
+## Relion workflow ##
+
+  1. this is a separate function from xcop that allows you to plan, import and manage your relion workflow
+  
+  
+  2. however, this is only relion -> workflow, two-way planning is too difficult for me
+  
+  
+  3. double-click on a node to create a linked node
+  
+  
+  4. at hide linkers mode, single-click can view a node's parent(s)
+  
+  
+  5. hold press right-click can move canvas
+  
+  
+  6. copy workflow basically is making a completely same copy for you to test out things
+  
+  
+  7. import 3D auto-refine info:
+    
+    can let you import the initial twist and resolution of the corresponding 3D auto-refine jobs into corresponding notes
+    
+  
+  8. auto-save workflow map when close
+
+
+## omni whiteboard ##
+
+A whiteboard you can paste your own text, such as commands, notes, etc. It supports searching function, so you can search whatever you remember! 
+
+
+All this will be saved under slurm_script/xcop_savings/last_inputs_username.json, together with all your parameters in other functions
+
+
+## Restrain Torsion ##
+isolde restrain torsions /E template /A angleRange 180
+isolde restrain torsions /I template /A angleRange 180
+isolde restrain torsions /C template /A angleRange 180
+isolde restrain torsions /G template /A angleRange 180
+isolde restrain torsions /F template /B angleRange 180
+isolde restrain torsions /J template /B angleRange 180
+isolde restrain torsions /D template /B angleRange 180
+isolde restrain torsions /H template /B angleRange 180
+
+Save as .cxc file and use in ChimeraX (e.g., restrain_torsion.cxc)
+
+I J
+E F
+A B
+C D
+G H
+
+isolde restrain torsions /M template /A angleRange 180
+isolde restrain torsions /E template /A angleRange 180
+isolde restrain torsions /I template /A angleRange 180
+isolde restrain torsions /Q template /A angleRange 180
+isolde restrain torsions /N template /B angleRange 180
+isolde restrain torsions /F template /B angleRange 180
+isolde restrain torsions /J template /B angleRange 180
+isolde restrain torsions /R template /B angleRange 180
+isolde restrain torsions /O template /C angleRange 180
+isolde restrain torsions /G template /C angleRange 180
+isolde restrain torsions /K template /C angleRange 180
+isolde restrain torsions /S template /C angleRange 180
+isolde restrain torsions /P template /D angleRange 180
+isolde restrain torsions /H template /D angleRange 180
+isolde restrain torsions /L template /D angleRange 180
+isolde restrain torsions /T template /D angleRange 180
+
+
+M N O P
+E F G H
+A B C D
+I J K L
+Q R S T
+
+
+

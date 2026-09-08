@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "repository": "songxou0909/xcop",
+  "branch": "main",
+  "generated_at": "2026-09-08T11:14:18+08:00",
+  "scripts": [
+    {
+      "path": "xcop",
+      "preserve": [
+        "shebang",
+        "software_versions"
+      ],
+      "executable": true,
+      "sha256": "eaece8595b7b72676e6435db257118db2ffc0df6cf4d6eb3f35f67e341d2a20e"
+    },
+    {
+      "path": "xcop_savings/2d_class_planner.py",
+      "sha256": "450034021bd8a8580e224ce1cd5b17a478014e997ff2d4eee9d6830ca65c2f03"
+    },
+    {
+      "path": "xcop_savings/atom2svg.py",
+      "sha256": "aadbb27c2cd0f62c0079fe825f668c270c415e8ae7f45c630468775d55feacc6"
+    },
+    {
+      "path": "xcop_savings/autofsc.py",
+      "sha256": "c976d6701e9efc3532f0535cabfd18bc29d5fd80623292092d34aa79e77d2162"
+    },
+    {
+      "path": "xcop_savings/AutoJPG/AutoJPG.py",
+      "sha256": "85d6de1cc73cede451c6d1110fffc00958ffcd4e262c3d4a7b5eb45f5fe056c6"
+    },
+    {
+      "path": "xcop_savings/foldx.py",
+      "sha256": "5e73ff99ced457891054d305cd393775778ecd234fc685c492d2a068964c1c8a"
+    },
+    {
+      "path": "xcop_savings/localres.py",
+      "sha256": "dacd7854e64fb3def1fada48b35349845de0394c0f5dc377f215b4c46d35abc5"
+    },
+    {
+      "path": "xcop_savings/modifier.py",
+      "sha256": "8159dcb58e785f4018c7aed74454d66ac5ff6bf15f8b317b725ce3d94ba90800"
+    },
+    {
+      "path": "xcop_savings/queue_monitor.py",
+      "preserve": [
+        "shebang"
+      ],
+      "executable": true,
+      "sha256": "f82801cc8cee7766fea0bdd185acbcc23c6721e099b1a621037205f8b8d852d4"
+    },
+    {
+      "path": "xcop_savings/quick_map.py",
+      "sha256": "52ee828b3b1acef726af379dab0e8a9be64935aa4ae2d3b43a4d6433ea617af8"
+    },
+    {
+      "path": "xcop_savings/scheduler.py",
+      "sha256": "75655bb93d29a3c1ae32b4e549fcfc6cf1a490b17e82a3cf17b8919e179050b4"
+    },
+    {
+      "path": "xcop_savings/validation.py",
+      "sha256": "c53d9ec279671b58606adec6a198a428feccebecaa06b1622f8c761f70f030b7"
+    },
+    {
+      "path": "xcop_savings/workflow.py",
+      "sha256": "84d82d2edc587545d41c3d7056a7d5d6b4fc8bb27872ea1f77af49aceae64fca"
+    },
+    {
+      "path": "xcop_savings/xrfd.py",
+      "sha256": "07177af35533f9ee7c02781de096cbd4e0827009d073a7b8b1ad737befad90a4"
+    },
+    {
+      "path": "xcop_setup.py",
+      "sha256": "1be8821465ddfafd70bc92d8e5202f54fcba615a82240508d6601587c027abe1"
+    }
+  ]
+}

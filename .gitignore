@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+
+# Local installer backups and runtime state
+.bashrc_*
+*.log
+*.xcop-update
+*.xcop-update-backup
+.tools/
+/tmp/
+
+# Internal lab documentation; keep locally and never publish.
+/xcop_user_manual.docx
+
+# FoldX is proprietary and its license prohibits redistribution. Keep the
+# installation instructions, but never commit a downloaded FoldX distribution.
+/xcop_savings/FoldX/*
+!/xcop_savings/FoldX/README.md
+
+# Amyloid Illustrator is third-party software. Keep only the installation
+# instructions unless its authors provide explicit redistribution permission.
+/xcop_savings/AutoIllustrate/*
+!/xcop_savings/AutoIllustrate/README.md
