@@ -2,7 +2,6 @@
   "schema_version": 1,
   "repository": "songxou0909/xcop",
   "branch": "main",
-  "generated_at": "2026-09-08T17:10:43+08:00",
   "scripts": [
     {
       "path": "xcop",
@@ -71,7 +70,7 @@
     },
     {
       "path": "xcop_setup.py",
-      "sha256": "f20cbaed781557537e7f745c390753113e107fc5bbe2dbd91427de9b1c34fbb5"
+      "sha256": "ba34bdec4b6f5fffdc3204dc3570dfc90bf6ec057680cbd8ffd35320cf26409f"
     }
   ]
 }
