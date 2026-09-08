@@ -53,8 +53,6 @@ class ScoreTableModel(QAbstractTableModel):
         self.match_count = 0
         self.show_seeds = False
         self.seed_rows = []
-        self.ignore_cyclic_rmsd = True
-        self.rmsd_ignored = []
 
     @staticmethod
     def _header_key(header):
@@ -105,29 +103,12 @@ class ScoreTableModel(QAbstractTableModel):
             passes = self.cell_passes.get(key, [])
             if key in self.CRITERIA and source_row < len(passes) and passes[source_row]:
                 return QColor("#315c3a")
-            if (
-                key == "rmsd"
-                and source_row < len(self.rmsd_ignored)
-                and self.rmsd_ignored[source_row]
-            ):
-                return QColor("#5a4a23")
             if self.all_match and self.all_match[source_row]:
                 return QColor("#263f2b")
 
         if role == Qt.ItemDataRole.ForegroundRole:
             if key in self.CRITERIA and self.cell_passes.get(key, [])[source_row]:
                 return QColor("#f1fff3")
-
-        if (
-            role == Qt.ItemDataRole.ToolTipRole
-            and key == "rmsd"
-            and source_row < len(self.rmsd_ignored)
-            and self.rmsd_ignored[source_row]
-        ):
-            return (
-                "RMSD is reported for this linear-reference to cyclic "
-                "prediction, but is not used as a pass/fail criterion."
-            )
 
         if role == Qt.ItemDataRole.ToolTipRole and key in self.CRITERIA:
             direction, label = self.CRITERIA[key]
@@ -147,7 +128,6 @@ class ScoreTableModel(QAbstractTableModel):
         self.all_match = []
         self.match_count = 0
         self.seed_rows = []
-        self.rmsd_ignored = []
         self.endResetModel()
 
     def load_csv_files(self, paths):
@@ -192,42 +172,18 @@ class ScoreTableModel(QAbstractTableModel):
         self.all_match = [False] * len(rows)
         self.match_count = 0
         self.endResetModel()
-        self.set_criteria(
-            self.criteria["rmsd"],
-            self.criteria["binder_ptm"],
-            self.criteria["pae_min"],
-            self.ignore_cyclic_rmsd,
-        )
+        self.set_criteria(**self.criteria)
 
-    def set_criteria(
-        self, rmsd, binder_ptm, pae_min, ignore_cyclic_rmsd=True
-    ):
+    def set_criteria(self, rmsd, binder_ptm, pae_min):
         self.criteria = {
             "rmsd": float(rmsd),
             "binder_ptm": float(binder_ptm),
             "pae_min": float(pae_min),
         }
-        self.ignore_cyclic_rmsd = bool(ignore_cyclic_rmsd)
 
         if not self.rows:
             self.match_count = 0
             return
-
-        topology_column = self.column_by_key.get("topology")
-        reference_topology_column = self.column_by_key.get(
-            "reference_topology"
-        )
-        self.rmsd_ignored = [
-            self.ignore_cyclic_rmsd
-            and topology_column is not None
-            and str(row[topology_column]).strip().lower() == "cyclic"
-            and (
-                reference_topology_column is None
-                or str(row[reference_topology_column]).strip().lower()
-                != "cyclic"
-            )
-            for row in self.rows
-        ]
 
         cell_passes = {}
         for key, (direction, _label) in self.CRITERIA.items():
@@ -245,16 +201,10 @@ class ScoreTableModel(QAbstractTableModel):
                     value is not None and value >= cutoff for value in values
                 ]
 
-        all_match = []
-        for row in range(len(self.rows)):
-            rmsd_passes = (
-                cell_passes["rmsd"][row] or self.rmsd_ignored[row]
-            )
-            all_match.append(
-                rmsd_passes
-                and cell_passes["binder_ptm"][row]
-                and cell_passes["pae_min"][row]
-            )
+        all_match = [
+            all(cell_passes[key][row] for key in self.CRITERIA)
+            for row in range(len(self.rows))
+        ]
         self.cell_passes = cell_passes
         self.all_match = all_match
         self._rebuild_row_order()
@@ -3661,25 +3611,6 @@ rc("close session")
             # Section 3
             rf3_group = QGroupBox("Section 3: RF3 Structure Validation")
             rf3_layout = QVBoxLayout(rf3_group)
-            topology_label = QLabel("Binder topology to validate:")
-            topology_layout = QHBoxLayout()
-            self.rf3_linear_chk = QCheckBox("Linear")
-            self.rf3_linear_chk.setChecked(True)
-            self.rf3_linear_chk.setToolTip(
-                "Predict the binder with free N- and C-termini."
-            )
-            self.rf3_cyclic_chk = QCheckBox("Head-to-tail cyclic")
-            self.rf3_cyclic_chk.setChecked(False)
-            self.rf3_cyclic_chk.setToolTip(
-                "Predict binder chain B with a peptide bond connecting the "
-                "last residue to the first. Select both topologies to run "
-                "and compare both predictions."
-            )
-            topology_layout.addWidget(self.rf3_linear_chk)
-            topology_layout.addWidget(self.rf3_cyclic_chk)
-            topology_layout.addStretch()
-            rf3_layout.addWidget(topology_label)
-            rf3_layout.addLayout(topology_layout)
             self.btn_run_rf3 = QPushButton("Run RF3")
             self.btn_run_rf3.clicked.connect(self.run_rf3)
             rf3_layout.addWidget(self.btn_run_rf3)
@@ -3708,22 +3639,6 @@ rc("close session")
                 "equal to this value. Decrease it to be stricter."
             )
             val_layout.addRow("Max RMSD (Å):", self.rmsd_cutoff_spin)
-
-            self.ignore_cyclic_rmsd_chk = QCheckBox(
-                "Ignore RMSD cutoff to cyclic predictions"
-            )
-            self.ignore_cyclic_rmsd_chk.setChecked(True)
-            self.ignore_cyclic_rmsd_chk.setToolTip(
-                "RFD3 generates the first-round reference as a linear "
-                "backbone. A cyclic RF3 prediction may therefore rearrange "
-                "when its termini are joined. When enabled, cyclic RMSD is "
-                "still calculated and displayed, but it is not used to "
-                "decide whether a first-round cyclic result passes "
-                "extraction. Linear predictions and cyclic predictions "
-                "iterated from a cyclic reference always use the RMSD "
-                "cutoff."
-            )
-            val_layout.addRow("", self.ignore_cyclic_rmsd_chk)
             
             self.ptm_cutoff_spin = QDoubleSpinBox()
             self.ptm_cutoff_spin.setRange(0.0, 1.0)
@@ -4005,9 +3920,6 @@ rc("close session")
             for checkbox in (
                 self.non_loopy_chk,
                 self.run_dssp_chk,
-                self.rf3_linear_chk,
-                self.rf3_cyclic_chk,
-                self.ignore_cyclic_rmsd_chk,
                 self.chk_hide_layers,
                 self.chk_hide_non_carbons,
                 self.chk_select_layers,
@@ -4015,16 +3927,6 @@ rc("close session")
                 checkbox.toggled.connect(
                     self.schedule_project_state_save
                 )
-
-            self.ignore_cyclic_rmsd_chk.toggled.connect(
-                lambda _checked: self.criteria_refresh_timer.start()
-            )
-            self.rf3_linear_chk.toggled.connect(
-                self.enforce_rf3_topology_selection
-            )
-            self.rf3_cyclic_chk.toggled.connect(
-                self.enforce_rf3_topology_selection
-            )
 
             for widget in (
                 self.num_designs_spin,
@@ -4196,7 +4098,6 @@ rc("close session")
                 self.rmsd_cutoff_spin.value(),
                 self.ptm_cutoff_spin.value(),
                 self.pae_cutoff_spin.value(),
-                self.ignore_cyclic_rmsd_chk.isChecked(),
             )
             self.update_scores_status()
 
@@ -4487,9 +4388,6 @@ rc("close session")
                 self.binder_length_input.setText("15-20")
                 self.non_loopy_chk.setChecked(True)
                 self.run_dssp_chk.setChecked(False)
-                self.rf3_linear_chk.setChecked(True)
-                self.rf3_cyclic_chk.setChecked(False)
-                self.ignore_cyclic_rmsd_chk.setChecked(True)
                 self.num_designs_spin.setValue(100)
                 self.num_batches_spin.setValue(20)
                 self.seqs_per_struct_spin.setValue(4)
@@ -4545,11 +4443,6 @@ rc("close session")
                 "binder_length": self.binder_length_input.text().strip(),
                 "non_loopy": self.non_loopy_chk.isChecked(),
                 "run_dssp": self.run_dssp_chk.isChecked(),
-                "rf3_linear": self.rf3_linear_chk.isChecked(),
-                "rf3_cyclic": self.rf3_cyclic_chk.isChecked(),
-                "ignore_cyclic_rmsd": (
-                    self.ignore_cyclic_rmsd_chk.isChecked()
-                ),
                 "num_designs": self.num_designs_spin.value(),
                 "num_batches": self.num_batches_spin.value(),
                 "seqs_per_struct": self.seqs_per_struct_spin.value(),
@@ -4579,23 +4472,6 @@ rc("close session")
             if "run_dssp" in parameters:
                 self.run_dssp_chk.setChecked(
                     bool(parameters["run_dssp"])
-                )
-            if "rf3_linear" in parameters:
-                self.rf3_linear_chk.setChecked(
-                    bool(parameters["rf3_linear"])
-                )
-            if "rf3_cyclic" in parameters:
-                self.rf3_cyclic_chk.setChecked(
-                    bool(parameters["rf3_cyclic"])
-                )
-            if not (
-                self.rf3_linear_chk.isChecked()
-                or self.rf3_cyclic_chk.isChecked()
-            ):
-                self.rf3_linear_chk.setChecked(True)
-            if "ignore_cyclic_rmsd" in parameters:
-                self.ignore_cyclic_rmsd_chk.setChecked(
-                    bool(parameters["ignore_cyclic_rmsd"])
                 )
             if "select_as_layers" in parameters:
                 self.chk_select_layers.setChecked(
@@ -5471,10 +5347,6 @@ rc("close session")
             if not pwd:
                 return
 
-            rf3_topologies = self.selected_rf3_topologies(show_warning=True)
-            if not rf3_topologies:
-                return
-
             self.btn_auto_run.setText("Submitting...")
             self.btn_auto_run.setEnabled(False)
             self.btn_cancel_jobs.setEnabled(False)
@@ -5500,9 +5372,7 @@ rc("close session")
                 self._write_mpnn_scripts(
                     pwd, self.seqs_per_struct_spin.value(), array_limit
                 )
-                self._write_rf3_scripts(
-                    pwd, array_limit, rf3_topologies
-                )
+                self._write_rf3_scripts(pwd, array_limit)
                 self._write_validation_scripts(pwd, array_limit)
 
                 stages = (
@@ -5765,41 +5635,9 @@ rc("close session")
             self._write_mpnn_scripts(pwd, seqs, array_limit)
             self.execute_command(["sbatch", "scripts/submit_mpnn.sh"], pwd, "MPNN Job Submitted Successfully.", "mpnn", self.btn_run_mpnn, "Run MPNN")
 
-        def selected_rf3_topologies(self, show_warning=False):
-            topologies = []
-            if self.rf3_linear_chk.isChecked():
-                topologies.append("linear")
-            if self.rf3_cyclic_chk.isChecked():
-                topologies.append("cyclic")
-            if not topologies and show_warning:
-                QMessageBox.warning(
-                    self,
-                    "Select RF3 Topology",
-                    "Select at least one binder topology: Linear or "
-                    "Head-to-tail cyclic.",
-                )
-            return topologies
-
-        def enforce_rf3_topology_selection(self, _checked=False):
-            if self._restoring_project_state:
-                return
-            if self.selected_rf3_topologies():
-                return
-
-            changed_checkbox = self.sender()
-            if changed_checkbox in (
-                self.rf3_linear_chk, self.rf3_cyclic_chk
-            ):
-                changed_checkbox.setChecked(True)
-            else:
-                self.rf3_linear_chk.setChecked(True)
-
         def run_rf3(self):
             pwd = self._check_workspace()
             if not pwd: return
-            topologies = self.selected_rf3_topologies(show_warning=True)
-            if not topologies:
-                return
             mpnn_dir = os.path.join(pwd, "mpnn_outputs")
             batches = [
                 d for d in os.listdir(mpnn_dir)
@@ -5813,7 +5651,7 @@ rc("close session")
                 )
                 return
             array_limit = len(batches) - 1
-            self._write_rf3_scripts(pwd, array_limit, topologies)
+            self._write_rf3_scripts(pwd, array_limit)
             self.execute_command(["sbatch", "scripts/submit_rf3.sh"], pwd, "RF3 Validation Job Submitted Successfully.", "rf3", self.btn_run_rf3, "Run RF3")
 
         def run_validation_slurm(self):
@@ -5850,7 +5688,6 @@ rc("close session")
                 rmsd,
                 ptm,
                 pae,
-                self.ignore_cyclic_rmsd_chk.isChecked(),
             )
             self.start_local_extraction(pwd)
 
@@ -5919,10 +5756,8 @@ rc("close session")
                 return
 
             filename_pattern = re.compile(
-                r"^batch_(\d+)_(.+)\.cif$", re.IGNORECASE
-            )
-            topology_pattern = re.compile(
-                r"(?:^|_)(linear|cyclic)(?:_|$)", re.IGNORECASE
+                r"(?:batch_(\d+)_)?.*?Binder_(.+?)_model_(\d+).*\.cif$",
+                re.IGNORECASE,
             )
             designs = []
             try:
@@ -5937,19 +5772,13 @@ rc("close session")
                     ):
                         continue
                     match = filename_pattern.match(entry.name)
-                    if not match:
+                    if not match or match.group(1) is None:
                         continue
-                    topology_matches = list(
-                        topology_pattern.finditer(match.group(2))
-                    )
-                    topology = (
-                        topology_matches[-1].group(1).lower()
-                        if topology_matches else "linear"
-                    )
                     designs.append({
                         "source": entry.path,
                         "batch": int(match.group(1)),
-                        "topology": topology,
+                        "binder": match.group(2),
+                        "model": match.group(3),
                     })
             except OSError as error:
                 QMessageBox.critical(
@@ -5993,7 +5822,7 @@ rc("close session")
                 os.makedirs(rfd3_output_dir, exist_ok=False)
 
                 copied_destinations = set()
-                for design_number, design in enumerate(designs):
+                for design in designs:
                     batch_dir = os.path.join(
                         rfd3_output_dir,
                         f"batch_{batch_map[design['batch']]}",
@@ -6001,8 +5830,8 @@ rc("close session")
                     os.makedirs(batch_dir, exist_ok=True)
                     destination = os.path.join(
                         batch_dir,
-                        f"Passed_Binder_{design['topology']}_"
-                        f"{design_number:06d}_model_0.cif",
+                        f"Passed_Binder_{design['binder']}_model_"
+                        f"{design['model']}.cif",
                     )
                     shutil.copy2(design["source"], destination)
                     copied_destinations.add(destination)
@@ -6026,20 +5855,6 @@ rc("close session")
 
             self.project_dir_input.setText(new_workspace)
             self.on_project_dir_changed()
-            copied_topologies = {
-                design["topology"] for design in designs
-            }
-            self._restoring_project_state = True
-            try:
-                self.rf3_linear_chk.setChecked(
-                    "linear" in copied_topologies
-                )
-                self.rf3_cyclic_chk.setChecked(
-                    "cyclic" in copied_topologies
-                )
-            finally:
-                self._restoring_project_state = False
-            self.save_project_state()
             QMessageBox.information(
                 self,
                 "Iteration Workspace Ready",
@@ -6284,79 +6099,21 @@ MPNNInferenceEngine(**engine_config).run(input_dicts=input_configs)
             slurm_mpnn_code = f'''#!/bin/bash\n#SBATCH --job-name=mpnn_seq\n#SBATCH --output=logs/%x_%A_%a.out\n#SBATCH --error=logs/%x_%A_%a.err\n#SBATCH --ntasks=1\n#SBATCH --cpus-per-task=2\n#SBATCH --mem=16G\n#SBATCH --time=04:00:00\n#SBATCH --partition=normal\n#SBATCH --gres=gpu:1\n#SBATCH --array=0-{array_limit}%8\n#SBATCH --export=NONE\n\nset -eo pipefail\n\neval "$(conda shell.bash hook)"\nconda activate rfdxcop\n\nCURRENT_INPUT_DIR="./rfd3_outputs/batch_${{SLURM_ARRAY_TASK_ID}}"\nCURRENT_OUTPUT_DIR="./mpnn_outputs/batch_${{SLURM_ARRAY_TASK_ID}}"\nmkdir -p $CURRENT_OUTPUT_DIR\n\npython scripts/run_mpnn.py --input_dir $CURRENT_INPUT_DIR --out_dir $CURRENT_OUTPUT_DIR --seqs_per_struct {seqs_per_struct}\n\nsed -i "s/ \\[\\]$/ '[]'/g" $CURRENT_OUTPUT_DIR/*.cif\n'''
             with open(os.path.join(base_dir, "scripts", "submit_mpnn.sh"), "w") as f: f.write(slurm_mpnn_code)
 
-        def _write_rf3_scripts(
-            self, base_dir, array_limit, topologies=("linear",)
-        ):
-            selected_topologies = tuple(topologies or ())
-            invalid_topologies = set(selected_topologies) - {
-                "linear", "cyclic"
-            }
-            if invalid_topologies or not selected_topologies:
-                raise ValueError(
-                    "RF3 requires at least one valid topology: linear or "
-                    "cyclic."
-                )
-            topology_flags = " ".join(
-                f"--{topology}" for topology in selected_topologies
-            )
-
+        def _write_rf3_scripts(self, base_dir, array_limit):
             run_rf3_code = '''import argparse
-import glob
-import os
-import shutil
-import tempfile
-
 from rf3.inference_engines.rf3 import RF3InferenceEngine
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--input_dir", type=str, required=True)
 parser.add_argument("--out_dir", type=str, required=True)
-parser.add_argument("--linear", action="store_true")
-parser.add_argument("--cyclic", action="store_true")
 args = parser.parse_args()
 
-topologies = [
-    topology
-    for topology, enabled in (
-        ("linear", args.linear),
-        ("cyclic", args.cyclic),
-    )
-    if enabled
-]
-if not topologies:
-    parser.error("select at least one of --linear or --cyclic")
-
-cif_files = sorted(glob.glob(os.path.join(args.input_dir, "*.cif")))
-if not cif_files:
-    raise SystemExit(f"No MPNN CIF files found in {args.input_dir}")
-
-engine = RF3InferenceEngine(ckpt_path="rf3", verbose=False)
-for topology in topologies:
-    # RF3 names its outputs after the input stem. Topology-labelled temporary
-    # copies keep linear and cyclic results in the same output directory
-    # without collisions or an extra directory level.
-    with tempfile.TemporaryDirectory(
-        prefix=f"xrfd_rf3_{topology}_"
-    ) as labeled_input_dir:
-        for source_path in cif_files:
-            source_name = os.path.basename(source_path)
-            source_stem, source_extension = os.path.splitext(source_name)
-            labeled_name = f"{source_stem}_{topology}{source_extension}"
-            shutil.copy2(
-                source_path,
-                os.path.join(labeled_input_dir, labeled_name),
-            )
-
-        run_options = {
-            "inputs": labeled_input_dir,
-            "out_dir": args.out_dir,
-            "ground_truth_conformer_selection": ["A"],
-            "template_selection": ["A"],
-        }
-        if topology == "cyclic":
-            run_options["cyclic_chains"] = ["B"]
-        engine.run(**run_options)
+RF3InferenceEngine(ckpt_path="rf3", verbose=False).run(
+    inputs=args.input_dir,
+    out_dir=args.out_dir,
+    ground_truth_conformer_selection=["A"],
+    template_selection=["A"],
+)
 '''
             with open(
                 os.path.join(base_dir, "scripts", "run_rf3.py"), "w"
@@ -6384,7 +6141,7 @@ conda activate rfdxcop
 CURRENT_INPUT_DIR="./mpnn_outputs/batch_${{SLURM_ARRAY_TASK_ID}}"
 CURRENT_OUTPUT_DIR="./rf3_outputs/batch_${{SLURM_ARRAY_TASK_ID}}"
 mkdir -p $CURRENT_OUTPUT_DIR
-python scripts/run_rf3.py --input_dir $CURRENT_INPUT_DIR --out_dir $CURRENT_OUTPUT_DIR {topology_flags}
+python scripts/run_rf3.py --input_dir $CURRENT_INPUT_DIR --out_dir $CURRENT_OUTPUT_DIR
 '''
             with open(
                 os.path.join(base_dir, "scripts", "submit_rf3.sh"), "w"
@@ -6435,25 +6192,6 @@ def extract_chain_sequence(structure_path, chain):
         return "Error"
 
 
-def topology_for_name(name):
-    without_seed = re.sub(
-        r"_seed-\\d+_sample-\\d+$", "", name, flags=re.IGNORECASE
-    )
-    match = re.search(
-        r"_(linear|cyclic)$", without_seed, flags=re.IGNORECASE
-    )
-    return match.group(1).lower() if match else "linear"
-
-
-def reference_topology_for_name(name):
-    match = re.fullmatch(
-        r"Passed_Binder_(linear|cyclic)_\\d+_model_\\d+",
-        name,
-        flags=re.IGNORECASE,
-    )
-    return match.group(1).lower() if match else "linear"
-
-
 results = []
 current_batch = os.path.basename(os.path.normpath(args.rf3_dir))
 
@@ -6472,8 +6210,6 @@ for root, _, files in os.walk(args.rf3_dir):
         if original_match is None:
             continue
         orig_id = original_match.group(1)
-        topology = topology_for_name(base_name)
-        reference_topology = reference_topology_for_name(orig_id)
         rfd3_path = os.path.join(
             args.rfd3_base_dir, current_batch, orig_id + ".cif"
         )
@@ -6521,8 +6257,6 @@ for root, _, files in os.walk(args.rf3_dir):
 
         results.append({
             "design_name": base_name,
-            "topology": topology,
-            "reference_topology": reference_topology,
             "batch": current_batch,
             "original_backbone": orig_id,
             "rmsd": val_rmsd,
@@ -6550,12 +6284,10 @@ if results:
             rmsd_cutoff,
             ptm_cutoff,
             pae_cutoff,
-            ignore_cyclic_rmsd=True,
         ):
             code = '''import csv
 import glob
 import os
-import re
 import shutil
 import warnings
 
@@ -6575,10 +6307,9 @@ TARGET_CHAIN = "B"
 RMSD_CUTOFF = __RMSD_CUTOFF__
 PTM_CUTOFF = __PTM_CUTOFF__
 PAE_CUTOFF = __PAE_CUTOFF__
-IGNORE_CYCLIC_RMSD = __IGNORE_CYCLIC_RMSD__
 
 MASTER_COLUMNS = [
-    "design_name", "topology", "reference_topology", "sample_type",
+    "design_name", "sample_type",
     "rmsd", "binder_ptm", "pae_min", "iptm", "plddt", "batch", "sequence",
 ]
 
@@ -6612,42 +6343,9 @@ def sample_type_for(row):
     return subpath.rstrip("/").rsplit("/", 1)[-1] or "Unknown"
 
 
-def topology_for(row):
-    existing = str(row.get("topology", "") or "").strip().lower()
-    if existing in {"linear", "cyclic"}:
-        return existing
-
-    design_name = str(row.get("design_name", "") or "")
-    without_seed = re.sub(
-        r"_seed-\\d+_sample-\\d+$", "", design_name, flags=re.IGNORECASE
-    )
-    match = re.search(
-        r"_(linear|cyclic)$", without_seed, flags=re.IGNORECASE
-    )
-    return match.group(1).lower() if match else "linear"
-
-
-def reference_topology_for(row):
-    existing = str(
-        row.get("reference_topology", "") or ""
-    ).strip().lower()
-    if existing in {"linear", "cyclic"}:
-        return existing
-
-    original_backbone = str(row.get("original_backbone", "") or "")
-    match = re.fullmatch(
-        r"Passed_Binder_(linear|cyclic)_\\d+_model_\\d+",
-        original_backbone,
-        flags=re.IGNORECASE,
-    )
-    return match.group(1).lower() if match else "linear"
-
-
 def normalized_master_row(row):
     normalized = {
         "design_name": row.get("design_name", ""),
-        "topology": topology_for(row),
-        "reference_topology": reference_topology_for(row),
         "sample_type": sample_type_for(row),
         "rmsd": row.get("rmsd", ""),
         "binder_ptm": row.get("binder_ptm", ""),
@@ -6864,20 +6562,12 @@ for row in iter_score_rows(score_sources):
     rmsd = number(row.get("rmsd"))
     ptm = number(row.get("binder_ptm"))
     pae = number(row.get("pae_min"))
-    rmsd_is_ignored = (
-        IGNORE_CYCLIC_RMSD
-        and row.get("topology") == "cyclic"
-        and row.get("reference_topology") != "cyclic"
-    )
-    rmsd_passes = rmsd_is_ignored or (
-        rmsd is not None and rmsd <= RMSD_CUTOFF
-    )
     if (
-        rmsd_passes
+        rmsd is not None and rmsd <= RMSD_CUTOFF
         and ptm is not None and ptm >= PTM_CUTOFF
         and pae is not None and pae <= PAE_CUTOFF
     ):
-        row["_rmsd"] = rmsd if rmsd is not None else float("inf")
+        row["_rmsd"] = rmsd
         row["_ptm"] = ptm
         row["_pae"] = pae
         passed_rows.append(row)
@@ -6888,8 +6578,7 @@ if not passed_rows:
     raise SystemExit(0)
 
 # The notebook extracts sequences only after filtering, then retains the
-# highest-pTM / lowest-PAE / lowest-RMSD representative of each sequence and
-# topology. The same sequence may be retained once as linear and once as cyclic.
+# highest-pTM / lowest-PAE / lowest-RMSD representative of each sequence.
 sequence_cache = {}
 resolved_rows = []
 missing_count = 0
@@ -6913,8 +6602,7 @@ resolved_rows.sort(
 )
 unique_by_sequence = {}
 for row in resolved_rows:
-    sequence_key = (row.get("topology", "linear"), row["sequence"])
-    unique_by_sequence.setdefault(sequence_key, row)
+    unique_by_sequence.setdefault(row["sequence"], row)
 unique_rows = list(unique_by_sequence.values())
 
 print(
@@ -6964,9 +6652,6 @@ print(f"Saved unique design lists to {UNIQUE_CSV} and {UNIQUE_TXT}")
                 "__PTM_CUTOFF__", repr(float(ptm_cutoff))
             ).replace(
                 "__PAE_CUTOFF__", repr(float(pae_cutoff))
-            ).replace(
-                "__IGNORE_CYCLIC_RMSD__",
-                repr(bool(ignore_cyclic_rmsd)),
             )
             with open(os.path.join(base_dir, "scripts", "run_consolidation.py"), "w") as f: f.write(code)
 
