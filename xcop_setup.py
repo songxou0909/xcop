@@ -15,7 +15,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
-from datetime import datetime, timezone
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
@@ -527,7 +526,6 @@ def generate_update_manifest(root=None):
         "schema_version": 1,
         "repository": UPDATE_REPOSITORY,
         "branch": UPDATE_BRANCH,
-        "generated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "scripts": scripts,
     }
     manifest_path = root / PurePosixPath(UPDATE_MANIFEST_PATH)
@@ -1933,8 +1931,11 @@ class SetupWizard:
                     needs_update = True
                     status_text = "Not installed"
                 else:
-                    _, prepared_data = self._prepare_remote_script(entry)
-                    needs_update = target.read_bytes() != prepared_data
+                    local_hash = update_script_sha256(
+                        target.read_bytes(),
+                        entry.get("preserve", []),
+                    )
+                    needs_update = local_hash != entry["sha256"]
                     status_text = "Update available" if needs_update else "Up to date"
                 statuses.append({
                     "entry": entry,
@@ -2228,20 +2229,16 @@ class SetupWizard:
                         ),
                     )
 
-            generated_at = manifest.get("generated_at", "unknown time")
             if errors_found:
                 status_var.set(
-                    f"Check incomplete: {errors_found} script(s) could not be verified. "
-                    f"Repository snapshot: {generated_at}"
+                    f"Check incomplete: {errors_found} installed script(s) could not be read."
                 )
                 status_label.config(fg="#e06c75")
             elif updates_found:
-                status_var.set(
-                    f"{updates_found} script update(s) available. Repository snapshot: {generated_at}"
-                )
+                status_var.set(f"{updates_found} script update(s) available.")
                 status_label.config(fg="#e5c07b")
             else:
-                status_var.set(f"All scripts are up to date. Repository snapshot: {generated_at}")
+                status_var.set("All scripts are up to date.")
                 status_label.config(fg=ACCENT_COLOR)
             refresh_button.config(state=tk.NORMAL)
 
