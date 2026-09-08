@@ -178,12 +178,14 @@ OPTIMAL_CUDA_VER = None
 CURRENT_CUDA_VER = None
 NEEDS_PYTORCH = False  # Dynamic flag to track if we need to install it
 
+XCOP_ROOT = Path(__file__).resolve().parent
+
 ENV_NAME = "xcop"
-SCRIPT_NAME = os.path.abspath("xcop")
+SCRIPT_NAME = str(XCOP_ROOT / "xcop")
 PACKAGES = ["pyqt6", "matplotlib", "numpy", "mrcfile", "scikit-learn", "pyqtgraph", "PyOpenGL", "biopython"]
 
 DEFAULT_ENV = "xcop"
-DEFAULT_SCRIPT = os.path.abspath("xcop")
+DEFAULT_SCRIPT = str(XCOP_ROOT / "xcop")
 DEFAULT_PACKAGES = ["pyqt6", "matplotlib", "numpy", "mrcfile", "scikit-learn", "pyqtgraph", "PyOpenGL", "biopython"]
 
 UPDATE_REPOSITORY = "songxou0909/xcop"
@@ -216,6 +218,38 @@ FOUNDRY_CHECKPOINT_FILENAMES = (
 )
 
 
+def build_foundry_bashrc_entry(checkpoint_dir):
+    """Return the managed comment/export pair for an absolute checkpoint path."""
+    checkpoint_dir = os.path.abspath(os.fspath(checkpoint_dir))
+    bashrc_checkpoint_dir = (
+        checkpoint_dir.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("$", "\\$")
+        .replace("`", "\\`")
+    )
+    export_line = f'export FOUNDRY_CHECKPOINT_DIRS="{bashrc_checkpoint_dir}"'
+    comment = f"# Added by rfdxcop setup wizard: {export_line}"
+    return comment, export_line
+
+
+def build_xcop_bashrc_entries(script_name, env_name, include_foundry=True):
+    """Build every managed ~/.bashrc entry from the same absolute XCOP root."""
+    script_dir = os.path.dirname(os.path.abspath(script_name))
+    export_line = f"export PATH={script_dir}:$PATH"
+    queue_monitor_path = os.path.join(script_dir, "xcop_savings", "queue_monitor.py")
+    alias_line = f"alias xq='{queue_monitor_path} &'"
+    entries = [
+        (f"# Added by {env_name} setup wizard: {export_line}", export_line),
+        (f"# Added by {env_name} setup wizard: {alias_line}", alias_line),
+    ]
+    if include_foundry:
+        checkpoint_dir = os.path.join(
+            script_dir, "xcop_savings", "foundry", "checkpoints"
+        )
+        entries.append(build_foundry_bashrc_entry(checkpoint_dir))
+    return entries
+
+
 def conda_environment_exists(env_name):
     """Return whether Conda has an environment whose final path component is env_name."""
     try:
@@ -238,6 +272,9 @@ def build_foundry_install_slurm_script(checkpoint_dir):
     """Build a fail-fast Slurm installer for Foundry and its base checkpoints."""
     checkpoint_dir = os.path.abspath(os.fspath(checkpoint_dir))
     quoted_checkpoint_dir = shlex.quote(checkpoint_dir)
+    bashrc_export_comment, bashrc_export_line = build_foundry_bashrc_entry(
+        checkpoint_dir
+    )
     required_checkpoints = "\n".join(
         f"    {shlex.quote(filename)}" for filename in FOUNDRY_CHECKPOINT_FILENAMES
     )
@@ -261,12 +298,6 @@ mkdir -p "$CHECKPOINT_DIR"
 eval "$(conda shell.bash hook)"
 conda activate {FOUNDRY_ENV_NAME}
 
-# Every XCOP inference job activates this environment.  Keeping the checkpoint
-# location in activate.d makes it available even when Slurm uses --export=NONE.
-mkdir -p "$CONDA_PREFIX/etc/conda/activate.d"
-cat > "$CONDA_PREFIX/etc/conda/activate.d/xcop_foundry_checkpoints.sh" <<'XCOP_FOUNDRY_ENV'
-export FOUNDRY_CHECKPOINT_DIRS={quoted_checkpoint_dir}
-XCOP_FOUNDRY_ENV
 export FOUNDRY_CHECKPOINT_DIRS="$CHECKPOINT_DIR"
 
 echo "Installing Foundry into the {FOUNDRY_ENV_NAME} environment..."
@@ -292,6 +323,24 @@ for checkpoint_name in "${{required_checkpoints[@]}}"; do
         exit 1
     fi
 done
+
+# Persist the verified absolute path both for interactive shells and for XCOP's
+# --export=NONE Slurm jobs, which all activate the rfdxcop Conda environment.
+FOUNDRY_BASHRC_EXPORT={shlex.quote(bashrc_export_line)}
+FOUNDRY_BASHRC_COMMENT={shlex.quote(bashrc_export_comment)}
+BASHRC_PATH="$HOME/.bashrc"
+touch "$BASHRC_PATH"
+if ! grep -Fqx -- "$FOUNDRY_BASHRC_EXPORT" "$BASHRC_PATH"; then
+    if [[ -s "$BASHRC_PATH" ]]; then
+        printf '\n' >> "$BASHRC_PATH"
+    fi
+    printf '%s\n%s\n' "$FOUNDRY_BASHRC_COMMENT" "$FOUNDRY_BASHRC_EXPORT" >> "$BASHRC_PATH"
+fi
+
+mkdir -p "$CONDA_PREFIX/etc/conda/activate.d"
+cat > "$CONDA_PREFIX/etc/conda/activate.d/xcop_foundry_checkpoints.sh" <<'XCOP_FOUNDRY_ENV'
+export FOUNDRY_CHECKPOINT_DIRS={quoted_checkpoint_dir}
+XCOP_FOUNDRY_ENV
 
 echo "Foundry installation complete. Verified ${{#required_checkpoints[@]}} checkpoints in $CHECKPOINT_DIR."
 rm -f "install_foundry_${{SLURM_JOB_ID}}.log"
@@ -322,13 +371,36 @@ def append_missing_bashrc_entries(bashrc_path, entries):
     return [command for _comment, command in missing_entries]
 
 
+def remove_managed_bashrc_entries(bashrc_path, entries):
+    """Remove all copies of managed comment/command pairs and return the line count."""
+    with open(bashrc_path, "r") as handle:
+        lines = handle.readlines()
+
+    stripped_lines = {line.strip() for line in lines}
+    comments_to_remove = {
+        comment for comment, _command in entries if comment in stripped_lines
+    }
+    commands_to_remove = {
+        command for comment, command in entries if comment in comments_to_remove
+    }
+    targets = comments_to_remove | commands_to_remove
+    if not targets:
+        return 0
+
+    lines_to_keep = [line for line in lines if line.strip() not in targets]
+    removed_count = len(lines) - len(lines_to_keep)
+    with open(bashrc_path, "w") as handle:
+        handle.writelines(lines_to_keep)
+    return removed_count
+
+
 class UpdateError(Exception):
     """Raised when an update cannot be verified or safely installed."""
 
 
 def get_xcop_root():
     """Return the folder containing this setup script."""
-    return Path(__file__).resolve().parent
+    return XCOP_ROOT
 
 
 def sha256_bytes(data):
@@ -2540,31 +2612,19 @@ class SetupWizard:
         
         script_dir = os.path.dirname(SCRIPT_NAME)
         bashrc_path = os.path.expanduser("~/.bashrc")
-        
-        export_line = f'export PATH={script_dir}:$PATH'
-        export_comment = f"# Added by {ENV_NAME} setup wizard: {export_line}"
-        
-        qm_path = os.path.join(script_dir, "xcop_savings", "queue_monitor.py")
-        alias_line = f"alias xq='{qm_path} &'"
-        alias_comment = f"# Added by {ENV_NAME} setup wizard: {alias_line}"
-        
-        rfd_export = ""
-        rfd_comment = ""
-        if self.rfd_var.get() or os.path.exists(os.path.join(script_dir, "xcop_savings", "foundry")):
-            foundry_checkpoints = os.path.join(script_dir, "xcop_savings", "foundry", "checkpoints")
-            rfd_export = f'export FOUNDRY_CHECKPOINT_DIRS="{foundry_checkpoints}"'
-            rfd_comment = f"# Added by rfdxcop setup wizard: {rfd_export}"
 
         # 1. Backup if requested and file exists
         if do_backup and os.path.exists(bashrc_path):
             self.backup_bashrc(bashrc_path, script_dir)
-            
-        entries = [
-            (export_comment, export_line),
-            (alias_comment, alias_line),
-        ]
-        if rfd_export:
-            entries.append((rfd_comment, rfd_export))
+
+        include_foundry = self.rfd_var.get() or os.path.exists(
+            os.path.join(script_dir, "xcop_savings", "foundry")
+        )
+        entries = build_xcop_bashrc_entries(
+            SCRIPT_NAME,
+            ENV_NAME,
+            include_foundry=include_foundry,
+        )
 
         try:
             added_commands = append_missing_bashrc_entries(bashrc_path, entries)
@@ -2696,15 +2756,11 @@ class SetupWizard:
         self.log("--- Uninstall Step 1: Removing PATH from ~/.bashrc ---")
         
         bashrc_path = os.path.expanduser("~/.bashrc")
-        script_dir = os.path.dirname(SCRIPT_NAME)
-        
-        export_comment = f"# Added by {ENV_NAME} setup wizard: export PATH={script_dir}:$PATH"
-        qm_path = os.path.join(script_dir, 'xcop_savings', 'queue_monitor.py')
-        alias_comment = f"# Added by {ENV_NAME} setup wizard: alias xq='{qm_path} &'"
-        
-        foundry_checkpoints = os.path.join(script_dir, "xcop_savings", "foundry", "checkpoints")
-        rfd_export = f'export FOUNDRY_CHECKPOINT_DIRS="{foundry_checkpoints}"'
-        rfd_comment = f"# Added by rfdxcop setup wizard: {rfd_export}"
+        entries = build_xcop_bashrc_entries(
+            SCRIPT_NAME,
+            ENV_NAME,
+            include_foundry=True,
+        )
         
         if not os.path.exists(bashrc_path):
             self.log(f">>> {bashrc_path} does not exist. Nothing to remove.")
@@ -2715,34 +2771,8 @@ class SetupWizard:
             self.backup_bashrc(bashrc_path, os.path.dirname(os.path.abspath(__file__)))
             
         try:
-            with open(bashrc_path, "r") as f:
-                lines = f.readlines()
-            
-            lines_to_keep = []
-            removed_count = 0
-            commands_to_remove = set()
-            
-            # First pass: identify comments and extract the exact commands to remove
-            for line in lines:
-                if line.strip() in [export_comment, alias_comment, rfd_comment]:
-                    cmd = line.strip().split("wizard: ")[1].strip()
-                    commands_to_remove.add(cmd)
-                    removed_count += 1 # Count the comment line
-                
-            # Second pass: keep lines that are neither the comment nor the extracted commands
-            for line in lines:
-                stripped = line.strip()
-                if stripped in [export_comment, alias_comment, rfd_comment]:
-                    continue # Already counted
-                elif stripped in commands_to_remove:
-                    removed_count += 1 # Count the actual command line
-                    commands_to_remove.remove(stripped) # Remove only once per comment just in case
-                else:
-                    lines_to_keep.append(line)
-            
+            removed_count = remove_managed_bashrc_entries(bashrc_path, entries)
             if removed_count > 0:
-                with open(bashrc_path, "w") as f:
-                    f.writelines(lines_to_keep)
                 self.log(f">>> Successfully removed {removed_count} lines from {bashrc_path} for '{ENV_NAME}'.")
             else:
                 self.log(f">>> Target environment '{ENV_NAME}' not found in {bashrc_path}. Nothing to remove.")
