@@ -6179,7 +6179,107 @@ rc("close session")
             with open(os.path.join(base_dir, "scripts", "submit_rfd3.sh"), "w") as f: f.write(slurm_rfd3_code)
 
         def _write_mpnn_scripts(self, base_dir, seqs_per_struct, array_limit):
-            run_mpnn_code = '''import argparse\nimport os, glob\nfrom mpnn.inference_engines.mpnn import MPNNInferenceEngine\n\nparser = argparse.ArgumentParser()\nparser.add_argument("--input_dir", type=str, required=True)\nparser.add_argument("--out_dir", type=str, required=True)\nparser.add_argument("--seqs_per_struct", type=int, default=4)\nargs = parser.parse_args()\n\ncif_files = glob.glob(os.path.join(args.input_dir, "*.cif"))\nif not cif_files: exit()\n\nengine_config = {"model_type": "protein_mpnn", "is_legacy_weights": True, "out_directory": args.out_dir, "write_structures": True, "write_fasta": False}\ninput_configs = [{"batch_size": args.seqs_per_struct, "remove_waters": True, "structure_path": f, "fixed_chains": ["A"]} for f in cif_files]\n\nMPNNInferenceEngine(**engine_config).run(input_dicts=input_configs)\n'''
+            run_mpnn_code = '''import argparse
+import glob
+import os
+
+import biotite.structure as struc
+import atomworks.io.utils.io_utils as atomworks_io
+from mpnn.inference_engines.mpnn import MPNNInferenceEngine
+
+
+# AtomWorks' entity_poly writer calculates residue-start indices on a
+# chain-filtered AtomArray, but uses them to index the full AtomArray.  This
+# makes every chain after the first advertise a sequence taken from chain A.
+# Calling the original builder on one chain at a time keeps the indices local;
+# rows that belong to the same entity are then merged back together.
+_original_build_entity_poly = atomworks_io._build_entity_poly
+
+
+def _build_entity_poly_with_chain_local_indices(atom_array):
+    structure = (
+        atom_array[0]
+        if isinstance(atom_array, struc.AtomArrayStack)
+        else atom_array
+    )
+    chain_starts = struc.get_chain_starts(structure)
+    rows_by_entity = {}
+    column_names = None
+
+    for chain_iid in structure.chain_iid[chain_starts]:
+        chain_array = structure[structure.chain_iid == chain_iid]
+        built = _original_build_entity_poly(chain_array)
+        category = built.get("entity_poly") if built else None
+        if not category:
+            continue
+
+        if column_names is None:
+            column_names = tuple(category.keys())
+        for row_index in range(len(category["entity_id"])):
+            row = {
+                column: category[column][row_index]
+                for column in column_names
+            }
+            entity_id = row["entity_id"]
+            if entity_id not in rows_by_entity:
+                rows_by_entity[entity_id] = row
+                continue
+
+            existing = rows_by_entity[entity_id]
+            strand_ids = [
+                strand_id
+                for strand_id in (
+                    str(existing["pdbx_strand_id"]) + "," +
+                    str(row["pdbx_strand_id"])
+                ).split(",")
+                if strand_id
+            ]
+            existing["pdbx_strand_id"] = ",".join(
+                dict.fromkeys(strand_ids)
+            )
+
+    if not rows_by_entity or column_names is None:
+        return {}
+    rows = list(rows_by_entity.values())
+    return {
+        "entity_poly": {
+            column: [row[column] for row in rows]
+            for column in column_names
+        }
+    }
+
+
+atomworks_io._build_entity_poly = _build_entity_poly_with_chain_local_indices
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--input_dir", type=str, required=True)
+parser.add_argument("--out_dir", type=str, required=True)
+parser.add_argument("--seqs_per_struct", type=int, default=4)
+args = parser.parse_args()
+
+cif_files = sorted(glob.glob(os.path.join(args.input_dir, "*.cif")))
+if not cif_files:
+    raise SystemExit(f"No RFD3 CIF files found in {args.input_dir}")
+
+engine_config = {
+    "model_type": "protein_mpnn",
+    "is_legacy_weights": True,
+    "out_directory": args.out_dir,
+    "write_structures": True,
+    "write_fasta": False,
+}
+input_configs = [
+    {
+        "batch_size": args.seqs_per_struct,
+        "remove_waters": True,
+        "structure_path": path,
+        "fixed_chains": ["A"],
+    }
+    for path in cif_files
+]
+
+MPNNInferenceEngine(**engine_config).run(input_dicts=input_configs)
+'''
             with open(os.path.join(base_dir, "scripts", "run_mpnn.py"), "w") as f: f.write(run_mpnn_code)
             slurm_mpnn_code = f'''#!/bin/bash\n#SBATCH --job-name=mpnn_seq\n#SBATCH --output=logs/%x_%A_%a.out\n#SBATCH --error=logs/%x_%A_%a.err\n#SBATCH --ntasks=1\n#SBATCH --cpus-per-task=2\n#SBATCH --mem=16G\n#SBATCH --time=04:00:00\n#SBATCH --partition=normal\n#SBATCH --gres=gpu:1\n#SBATCH --array=0-{array_limit}%8\n#SBATCH --export=NONE\n\nset -eo pipefail\n\neval "$(conda shell.bash hook)"\nconda activate rfdxcop\n\nCURRENT_INPUT_DIR="./rfd3_outputs/batch_${{SLURM_ARRAY_TASK_ID}}"\nCURRENT_OUTPUT_DIR="./mpnn_outputs/batch_${{SLURM_ARRAY_TASK_ID}}"\nmkdir -p $CURRENT_OUTPUT_DIR\n\npython scripts/run_mpnn.py --input_dir $CURRENT_INPUT_DIR --out_dir $CURRENT_OUTPUT_DIR --seqs_per_struct {seqs_per_struct}\n\nsed -i "s/ \\[\\]$/ '[]'/g" $CURRENT_OUTPUT_DIR/*.cif\n'''
             with open(os.path.join(base_dir, "scripts", "submit_mpnn.sh"), "w") as f: f.write(slurm_mpnn_code)
@@ -6298,6 +6398,13 @@ import biotite.structure.io.pdbx as pdbx
 from biotite.structure import rmsd, superimpose
 from atomworks.constants import PROTEIN_BACKBONE_ATOM_NAMES
 
+AA_THREE_TO_ONE = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+}
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--rf3_dir", type=str, required=True)
 parser.add_argument("--rfd3_base_dir", type=str, required=True)
@@ -6308,6 +6415,24 @@ args = parser.parse_args()
 def get_backbone(arr, chain):
     mask = np.isin(arr.atom_name, PROTEIN_BACKBONE_ATOM_NAMES)
     return arr[mask][arr[mask].chain_id == chain]
+
+
+def extract_chain_sequence(structure_path, chain):
+    try:
+        structure = pdbx.get_structure(
+            pdbx.CIFFile.read(structure_path), model=1
+        )
+        ca_atoms = structure[
+            (structure.chain_id == chain) & (structure.atom_name == "CA")
+        ]
+        if len(ca_atoms) == 0:
+            return "Error"
+        return "".join(
+            AA_THREE_TO_ONE.get(res_name, "X")
+            for res_name in ca_atoms.res_name
+        )
+    except Exception:
+        return "Error"
 
 
 def topology_for_name(name):
@@ -6356,23 +6481,32 @@ for root, _, files in os.walk(args.rf3_dir):
         val_rmsd = "Error"
         if os.path.exists(rfd3_path):
             try:
-                ref = get_backbone(
-                    pdbx.get_structure(
-                        pdbx.CIFFile.read(rfd3_path), model=1
-                    ),
-                    "B",
+                reference = pdbx.get_structure(
+                    pdbx.CIFFile.read(rfd3_path), model=1
                 )
-                mob = get_backbone(
-                    pdbx.get_structure(
-                        pdbx.CIFFile.read(model_path), model=1
-                    ),
-                    "B",
+                mobile = pdbx.get_structure(
+                    pdbx.CIFFile.read(model_path), model=1
                 )
-                val_rmsd = (
-                    rmsd(ref, superimpose(ref, mob)[0])
-                    if len(ref) == len(mob)
-                    else "Error"
-                )
+                reference_target = get_backbone(reference, "A")
+                mobile_target = get_backbone(mobile, "A")
+                reference_binder = get_backbone(reference, "B")
+                mobile_binder = get_backbone(mobile, "B")
+
+                if (
+                    len(reference_target) == len(mobile_target)
+                    and len(reference_binder) == len(mobile_binder)
+                    and len(reference_target) > 0
+                    and len(reference_binder) > 0
+                ):
+                    _, target_transform = superimpose(
+                        reference_target, mobile_target
+                    )
+                    target_aligned_binder = target_transform.apply(
+                        mobile_binder
+                    )
+                    val_rmsd = rmsd(
+                        reference_binder, target_aligned_binder
+                    )
             except Exception:
                 pass
 
@@ -6397,6 +6531,7 @@ for root, _, files in os.walk(args.rf3_dir):
             "iptm": data.get("iptm"),
             "plddt": data.get("overall_plddt"),
             "rf3_subpath": os.path.relpath(root, args.rf3_dir),
+            "sequence": extract_chain_sequence(model_path, "B"),
         })
 
 if results:
@@ -6444,7 +6579,7 @@ IGNORE_CYCLIC_RMSD = __IGNORE_CYCLIC_RMSD__
 
 MASTER_COLUMNS = [
     "design_name", "topology", "reference_topology", "sample_type",
-    "rmsd", "binder_ptm", "pae_min", "iptm", "plddt", "batch",
+    "rmsd", "binder_ptm", "pae_min", "iptm", "plddt", "batch", "sequence",
 ]
 
 NUMERIC_COLUMNS = {"rmsd", "binder_ptm", "pae_min", "iptm", "plddt"}
@@ -6520,7 +6655,15 @@ def normalized_master_row(row):
         "iptm": row.get("iptm", ""),
         "plddt": row.get("plddt", ""),
         "batch": row.get("batch", ""),
+        "sequence": row.get("sequence", ""),
     }
+    if not normalized["sequence"]:
+        cif_path = find_cif(row)
+        normalized["sequence"] = (
+            extract_sequence_from_cif(cif_path, chain_id=TARGET_CHAIN)
+            if cif_path and os.path.exists(cif_path)
+            else "FileNotFound"
+        )
     for column in NUMERIC_COLUMNS:
         numeric_value = number(normalized.get(column))
         normalized[column] = (
@@ -6799,7 +6942,7 @@ for row in unique_rows:
     except OSError as error:
         print(f"Could not copy {cif_path}: {error}")
 
-unique_columns = MASTER_COLUMNS + ["sequence"]
+unique_columns = MASTER_COLUMNS
 with open(UNIQUE_CSV, "w", newline="", encoding="utf-8") as handle:
     writer = csv.DictWriter(handle, fieldnames=unique_columns)
     writer.writeheader()

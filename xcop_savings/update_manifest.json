@@ -2,7 +2,7 @@
   "schema_version": 1,
   "repository": "songxou0909/xcop",
   "branch": "main",
-  "generated_at": "2026-09-08T11:14:18+08:00",
+  "generated_at": "2026-09-08T16:10:40+08:00",
   "scripts": [
     {
       "path": "xcop",
@@ -67,11 +67,11 @@
     },
     {
       "path": "xcop_savings/xrfd.py",
-      "sha256": "07177af35533f9ee7c02781de096cbd4e0827009d073a7b8b1ad737befad90a4"
+      "sha256": "91ce4c0f19ce20a97299ec5b950b484229aa3006789d9b39866c9716737d6eda"
     },
     {
       "path": "xcop_setup.py",
-      "sha256": "1be8821465ddfafd70bc92d8e5202f54fcba615a82240508d6601587c027abe1"
+      "sha256": "5dd3558c776d6f68934e75e865f7c5a1c23f19b15aebcca86d69623b23b247fb"
     }
   ]
 }
