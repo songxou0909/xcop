@@ -579,44 +579,56 @@ checkpoint_is_valid() {{
     [[ "$actual_hash" == "$expected_hash" ]]
 }}
 
-# files.ipd.uw.edu is dual-stack, but some compute nodes cannot create IPv6
-# sockets. Foundry uses urllib without an address-family option, so run its
-# normal registry-backed installer with DNS resolution constrained to IPv4.
-download_checkpoint_ipv4() {{
+# Prefer IPv6, with IPv4 fallback for compute nodes that cannot use IPv6.
+# Each retry round tries both address families using Foundry's own installer.
+download_checkpoint() {{
     local model_name="$1"
     local checkpoint_dir="$2"
     local checkpoint_path="$3"
     local attempt
+    local ip_version
 
     for attempt in 1 2 3; do
-        echo "IPv4 download attempt $attempt/3 for $model_name..."
-        rm -f "$checkpoint_path"
-        if python - "$model_name" "$checkpoint_dir" <<'PY'
+        for ip_version in 6 4; do
+            echo "IPv$ip_version download attempt $attempt/3 for $model_name..."
+            rm -f "$checkpoint_path"
+            if python -u - "$model_name" "$checkpoint_dir" "$ip_version" <<'PY'
 import socket
 import sys
 from pathlib import Path
 
 _original_getaddrinfo = socket.getaddrinfo
+_download_family = socket.AF_INET6 if sys.argv[3] == "6" else socket.AF_INET
 
 
-def _getaddrinfo_ipv4(host, port, family=0, socktype=0, proto=0, flags=0):
+def _getaddrinfo_for_download(host, port, family=0, type=0, proto=0, flags=0):
     return _original_getaddrinfo(
-        host, port, socket.AF_INET, socktype, proto, flags
+        host, port, _download_family, type, proto, flags
     )
 
 
-socket.getaddrinfo = _getaddrinfo_ipv4
+socket.getaddrinfo = _getaddrinfo_for_download
+# Bound socket connect/read waits, without limiting the total download duration.
+socket.setdefaulttimeout(60)
 
 from foundry_cli.download_checkpoints import install_model
 
 install_model(sys.argv[1], Path(sys.argv[2]))
 PY
-        then
-            return 0
-        fi
+            then
+                return 0
+            fi
 
-        rm -f "$checkpoint_path"
+            rm -f "$checkpoint_path"
+            if [[ "$ip_version" == "6" ]]; then
+                echo "IPv6 download failed for $model_name; falling back to IPv4."
+            else
+                echo "IPv4 download also failed for $model_name." >&2
+            fi
+        done
+
         if [[ "$attempt" -lt 3 ]]; then
+            echo "Retrying $model_name after both address families failed..."
             sleep "$((attempt * 5))"
         fi
     done
@@ -637,8 +649,8 @@ for checkpoint_index in "${{!required_models[@]}}"; do
         echo "Removing incomplete or invalid checkpoint: $checkpoint_path"
         rm -f "$checkpoint_path"
     fi
-    echo "Downloading $model_name to $CHECKPOINT_DIR over IPv4..."
-    if ! download_checkpoint_ipv4 "$model_name" "$CHECKPOINT_DIR" "$checkpoint_path"; then
+    echo "Downloading $model_name to $CHECKPOINT_DIR (IPv6 preferred, IPv4 fallback)..."
+    if ! download_checkpoint "$model_name" "$CHECKPOINT_DIR" "$checkpoint_path"; then
         # Foundry writes directly to the destination; do not leave a partial file
         # that a later retry could mistake for a completed checkpoint.
         rm -f "$checkpoint_path"
