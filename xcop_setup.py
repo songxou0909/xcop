@@ -209,11 +209,22 @@ UPDATE_EXCLUDED_DIRECTORIES = {
 }
 
 FOUNDRY_ENV_NAME = "rfdxcop"
-FOUNDRY_CHECKPOINT_FILENAMES = (
-    "rfd3_latest.ckpt",
-    "proteinmpnn_v_48_020.pt",
-    "ligandmpnn_v_32_010_25.pt",
-    "rf3_foundry_01_24_latest_remapped.ckpt",
+FOUNDRY_REQUIRED_MODULES = (
+    "rfd3",
+    "mpnn",
+    "rf3",
+    "atomworks",
+    "lightning",
+    "biotite",
+)
+FOUNDRY_REQUIRED_CHECKPOINTS = (
+    ("rfd3", "rfd3_latest.ckpt"),
+    ("proteinmpnn", "proteinmpnn_v_48_020.pt"),
+    ("ligandmpnn", "ligandmpnn_v_32_010_25.pt"),
+    ("rf3", "rf3_foundry_01_24_latest_remapped.ckpt"),
+)
+FOUNDRY_CHECKPOINT_FILENAMES = tuple(
+    filename for _model_name, filename in FOUNDRY_REQUIRED_CHECKPOINTS
 )
 
 
@@ -251,6 +262,11 @@ def build_xcop_bashrc_entries(script_name, env_name, include_foundry=True):
 
 def conda_environment_exists(env_name):
     """Return whether Conda has an environment whose final path component is env_name."""
+    return conda_environment_path(env_name) is not None
+
+
+def conda_environment_path(env_name):
+    """Return the absolute path of a named Conda environment, if it exists."""
     try:
         result = subprocess.run(
             ["conda", "env", "list", "--json"],
@@ -260,11 +276,180 @@ def conda_environment_exists(env_name):
             check=False,
         )
         if result.returncode != 0:
-            return False
+            return None
         environment_paths = json.loads(result.stdout).get("envs", [])
-        return any(Path(path).name == env_name for path in environment_paths)
+        return next(
+            (os.path.abspath(path) for path in environment_paths if Path(path).name == env_name),
+            None,
+        )
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def foundry_packages_installed(env_name=FOUNDRY_ENV_NAME):
+    """Check the Foundry distribution and the modules used by XCOP's RFD workflow."""
+    package_check_code = (
+        "from importlib.metadata import distribution; "
+        "from importlib.util import find_spec; "
+        "import sys; "
+        "distribution('rc-foundry'); "
+        f"sys.exit(1 if any(find_spec(name) is None for name in {FOUNDRY_REQUIRED_MODULES!r}) else 0)"
+    )
+    try:
+        result = subprocess.run(
+            ["conda", "run", "-n", env_name, "python", "-c", package_check_code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        return result.returncode == 0
+    except OSError:
         return False
+
+
+def find_missing_foundry_checkpoints(checkpoint_dir):
+    """Return required checkpoint names that are absent or empty."""
+    return tuple(
+        filename
+        for filename in FOUNDRY_CHECKPOINT_FILENAMES
+        if not os.path.isfile(os.path.join(checkpoint_dir, filename))
+        or os.path.getsize(os.path.join(checkpoint_dir, filename)) == 0
+    )
+
+
+def shell_file_has_effective_export(shell_path, expected_export, variable_name):
+    """Return whether the last active export for variable_name is the expected one."""
+    if not shell_path or not os.path.isfile(shell_path):
+        return False
+    export_pattern = re.compile(rf"^\s*export\s+{re.escape(variable_name)}=")
+    try:
+        with open(shell_path, "r") as handle:
+            active_exports = [
+                line.strip()
+                for line in handle
+                if not line.lstrip().startswith("#") and export_pattern.match(line)
+            ]
+    except OSError:
+        return False
+    return bool(active_exports) and active_exports[-1] == expected_export
+
+
+def inspect_foundry_setup(script_name, bashrc_path=None):
+    """Inspect every independently repairable part of the XCOP Foundry setup."""
+    script_dir = os.path.dirname(os.path.abspath(script_name))
+    checkpoint_dir = os.path.join(script_dir, "xcop_savings", "foundry", "checkpoints")
+    bashrc_path = bashrc_path or os.path.expanduser("~/.bashrc")
+    _comment, expected_export = build_foundry_bashrc_entry(checkpoint_dir)
+
+    env_path = conda_environment_path(FOUNDRY_ENV_NAME)
+    env_exists = env_path is not None
+    packages_ok = env_exists and foundry_packages_installed(FOUNDRY_ENV_NAME)
+    missing_checkpoints = find_missing_foundry_checkpoints(checkpoint_dir)
+    bashrc_ok = shell_file_has_effective_export(
+        bashrc_path, expected_export, "FOUNDRY_CHECKPOINT_DIRS"
+    )
+    activation_path = (
+        os.path.join(
+            env_path,
+            "etc",
+            "conda",
+            "activate.d",
+            "xcop_foundry_checkpoints.sh",
+        )
+        if env_path
+        else None
+    )
+    activation_export_ok = shell_file_has_effective_export(
+        activation_path, expected_export, "FOUNDRY_CHECKPOINT_DIRS"
+    )
+    status = {
+        "env_exists": env_exists,
+        "packages_ok": packages_ok,
+        "checkpoint_dir": checkpoint_dir,
+        "missing_checkpoints": missing_checkpoints,
+        "checkpoints_ok": not missing_checkpoints,
+        "bashrc_ok": bashrc_ok,
+        "activation_export_ok": activation_export_ok,
+    }
+    status["ready"] = all(
+        (
+            status["env_exists"],
+            status["packages_ok"],
+            status["checkpoints_ok"],
+            status["bashrc_ok"],
+            status["activation_export_ok"],
+        )
+    )
+    return status
+
+
+def describe_foundry_repairs(status):
+    """Return short descriptions of the Foundry components that need repair."""
+    repairs = []
+    if not status["env_exists"]:
+        repairs.append(f"Conda environment '{FOUNDRY_ENV_NAME}'")
+    elif not status["packages_ok"]:
+        repairs.append("required Foundry packages")
+    if not status["checkpoints_ok"]:
+        repairs.append("required checkpoints")
+    if not status["bashrc_ok"]:
+        repairs.append("~/.bashrc checkpoint export")
+    if not status["activation_export_ok"]:
+        repairs.append("rfdxcop activation export")
+    return repairs
+
+
+def extract_sbatch_job_id(output):
+    """Extract a Slurm job ID from normal or --parsable sbatch output."""
+    match = re.search(r"Submitted batch job\s+(\d+)", output or "")
+    if not match:
+        match = re.search(r"(?m)^\s*(\d+)(?:;\S+)?\s*$", output or "")
+    return match.group(1) if match else None
+
+
+def read_foundry_slurm_diagnostics(directory, sbatch_output, max_chars=8000):
+    """Read the output/error files for the submitted Foundry job, when available."""
+    job_id = extract_sbatch_job_id(sbatch_output)
+    if not job_id:
+        return ""
+
+    sections = []
+    for filename in (
+        f"install_foundry_{job_id}.log",
+        f"install_foundry_{job_id}.err",
+        f"slurm-{job_id}.out",  # Compatibility with scripts generated before stderr was explicit.
+    ):
+        path = os.path.join(directory, filename)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                content = handle.read().strip()
+        except OSError:
+            continue
+        if content:
+            sections.append(f"--- {filename} ---\n{content}")
+
+    if not sections:
+        return ""
+    return "\n\n".join(sections)[-max_chars:]
+
+
+def build_uninstall_bashrc_entries(script_name, env_name):
+    """Return only the managed shell entries owned by the uninstall target."""
+    if env_name == FOUNDRY_ENV_NAME:
+        checkpoint_dir = os.path.join(
+            os.path.dirname(os.path.abspath(script_name)),
+            "xcop_savings",
+            "foundry",
+            "checkpoints",
+        )
+        return [build_foundry_bashrc_entry(checkpoint_dir)]
+    return build_xcop_bashrc_entries(
+        script_name,
+        env_name,
+        include_foundry=(env_name == DEFAULT_ENV),
+    )
 
 
 def build_foundry_install_slurm_script(checkpoint_dir):
@@ -277,6 +462,17 @@ def build_foundry_install_slurm_script(checkpoint_dir):
     required_checkpoints = "\n".join(
         f"    {shlex.quote(filename)}" for filename in FOUNDRY_CHECKPOINT_FILENAMES
     )
+    required_models = "\n".join(
+        f"    {shlex.quote(model_name)}"
+        for model_name, _filename in FOUNDRY_REQUIRED_CHECKPOINTS
+    )
+    package_check_code = (
+        "from importlib.metadata import distribution; "
+        "from importlib.util import find_spec; "
+        "import sys; "
+        "distribution('rc-foundry'); "
+        f"sys.exit(1 if any(find_spec(name) is None for name in {FOUNDRY_REQUIRED_MODULES!r}) else 0)"
+    )
 
     return f'''#!/bin/bash
 #SBATCH --job-name=install_rfd
@@ -287,62 +483,177 @@ def build_foundry_install_slurm_script(checkpoint_dir):
 #SBATCH --mem=16G
 #SBATCH --time=02:00:00
 #SBATCH --output=install_foundry_%j.log
+#SBATCH --error=install_foundry_%j.err
 
-set -Eeuo pipefail
-trap 'echo "Foundry installation failed at line $LINENO." >&2' ERR
+# Conda's activate/deactivate hooks are not compatible with Bash nounset (`set -u`).
+set -Ee -o pipefail
+trap 'status=$?; echo "Foundry installation failed at line $LINENO while running: $BASH_COMMAND (exit $status)." >&2' ERR
 
 CHECKPOINT_DIR={quoted_checkpoint_dir}
 mkdir -p "$CHECKPOINT_DIR"
 
 eval "$(conda shell.bash hook)"
-conda activate {FOUNDRY_ENV_NAME}
 
+if conda run -n {FOUNDRY_ENV_NAME} python -c 'pass' >/dev/null 2>&1; then
+    echo "Reusing existing Conda environment: {FOUNDRY_ENV_NAME}"
+else
+    echo "Creating Conda environment: {FOUNDRY_ENV_NAME}"
+    conda create -n {FOUNDRY_ENV_NAME} python=3.12 -y
+fi
+
+conda activate {FOUNDRY_ENV_NAME}
 export FOUNDRY_CHECKPOINT_DIRS="$CHECKPOINT_DIR"
 
-echo "Installing Foundry into the {FOUNDRY_ENV_NAME} environment..."
-python -m pip install "rc-foundry[all]"
+if python -c {shlex.quote(package_check_code)} >/dev/null 2>&1; then
+    echo "Required Foundry packages are already installed."
+else
+    echo "Installing missing Foundry packages into {FOUNDRY_ENV_NAME}..."
+    python -m pip install "rc-foundry[all]"
+fi
+python -c {shlex.quote(package_check_code)}
 
+# Prepare the verified absolute path, but do not persist it until every required
+# checkpoint has been verified successfully.
+FOUNDRY_BASHRC_EXPORT={shlex.quote(bashrc_export_line)}
+FOUNDRY_BASHRC_COMMENT={shlex.quote(bashrc_export_comment)}
+BASHRC_PATH="$HOME/.bashrc"
+
+persist_checkpoint_exports() {{
+local activation_export_path
+local current_activation_export
+touch "$BASHRC_PATH"
+
+current_export="$(grep -E '^[[:space:]]*export[[:space:]]+FOUNDRY_CHECKPOINT_DIRS=' "$BASHRC_PATH" | tail -n 1 || true)"
+if [[ "$current_export" != "$FOUNDRY_BASHRC_EXPORT" ]]; then
+    bashrc_tmp="$(mktemp "${{BASHRC_PATH}}.xcop.XXXXXX")"
+    awk '
+        /^[[:space:]]*#[[:space:]]*Added by rfdxcop setup wizard: export FOUNDRY_CHECKPOINT_DIRS=/ {{ next }}
+        /^[[:space:]]*export[[:space:]]+FOUNDRY_CHECKPOINT_DIRS=/ {{ next }}
+        {{ print }}
+    ' "$BASHRC_PATH" > "$bashrc_tmp"
+    cat "$bashrc_tmp" > "$BASHRC_PATH"
+    rm -f "$bashrc_tmp"
+    if [[ -s "$BASHRC_PATH" ]]; then
+        printf '\\n' >> "$BASHRC_PATH"
+    fi
+    printf '%s\\n%s\\n' "$FOUNDRY_BASHRC_COMMENT" "$FOUNDRY_BASHRC_EXPORT" >> "$BASHRC_PATH"
+    echo "Updated $BASHRC_PATH with the Foundry checkpoint export."
+else
+    echo "The Foundry checkpoint export is already correct in $BASHRC_PATH."
+fi
+
+activation_export_path="$CONDA_PREFIX/etc/conda/activate.d/xcop_foundry_checkpoints.sh"
+current_activation_export="$(grep -E '^[[:space:]]*export[[:space:]]+FOUNDRY_CHECKPOINT_DIRS=' "$activation_export_path" 2>/dev/null | tail -n 1 || true)"
+if [[ "$current_activation_export" == "$FOUNDRY_BASHRC_EXPORT" ]]; then
+    echo "The Foundry Conda activation export is already correct."
+else
+    mkdir -p "$(dirname "$activation_export_path")"
+    printf '%s\\n' "$FOUNDRY_BASHRC_EXPORT" > "$activation_export_path"
+    echo "Updated the Foundry Conda activation export."
+fi
+}}
+
+required_models=(
+{required_models}
+)
 required_checkpoints=(
 {required_checkpoints}
 )
-for checkpoint_name in "${{required_checkpoints[@]}}"; do
-    # Foundry skips any destination that already exists, including an empty file.
-    # Remove only empty checkpoint files so an interrupted download can be repaired.
-    if [[ -e "$CHECKPOINT_DIR/$checkpoint_name" && ! -s "$CHECKPOINT_DIR/$checkpoint_name" ]]; then
-        rm -f "$CHECKPOINT_DIR/$checkpoint_name"
+
+checkpoint_is_valid() {{
+    local model_name="$1"
+    local checkpoint_name="$2"
+    local checkpoint_path="$CHECKPOINT_DIR/$checkpoint_name"
+    local expected_hash
+    local actual_hash
+
+    [[ -s "$checkpoint_path" ]] || return 1
+    if ! expected_hash="$(python -c 'from foundry.inference_engines.checkpoint_registry import REGISTERED_CHECKPOINTS; import sys; print(getattr(REGISTERED_CHECKPOINTS[sys.argv[1]], "sha256", "") or "")' "$model_name")"; then
+        return 1
     fi
-done
+    if [[ -z "$expected_hash" ]]; then
+        return 0
+    fi
+    echo "Verifying $checkpoint_name..."
+    actual_hash="$(sha256sum "$checkpoint_path" | awk '{{print $1}}')"
+    [[ "$actual_hash" == "$expected_hash" ]]
+}}
 
-echo "Downloading Foundry base models to $CHECKPOINT_DIR..."
-foundry install base-models --checkpoint-dir "$CHECKPOINT_DIR"
+# files.ipd.uw.edu is dual-stack, but some compute nodes cannot create IPv6
+# sockets. Foundry uses urllib without an address-family option, so run its
+# normal registry-backed installer with DNS resolution constrained to IPv4.
+download_checkpoint_ipv4() {{
+    local model_name="$1"
+    local checkpoint_dir="$2"
+    local checkpoint_path="$3"
+    local attempt
 
-for checkpoint_name in "${{required_checkpoints[@]}}"; do
-    if [[ ! -s "$CHECKPOINT_DIR/$checkpoint_name" ]]; then
-        echo "Missing or empty checkpoint: $CHECKPOINT_DIR/$checkpoint_name" >&2
+    for attempt in 1 2 3; do
+        echo "IPv4 download attempt $attempt/3 for $model_name..."
+        rm -f "$checkpoint_path"
+        if python - "$model_name" "$checkpoint_dir" <<'PY'
+import socket
+import sys
+from pathlib import Path
+
+_original_getaddrinfo = socket.getaddrinfo
+
+
+def _getaddrinfo_ipv4(host, port, family=0, socktype=0, proto=0, flags=0):
+    return _original_getaddrinfo(
+        host, port, socket.AF_INET, socktype, proto, flags
+    )
+
+
+socket.getaddrinfo = _getaddrinfo_ipv4
+
+from foundry_cli.download_checkpoints import install_model
+
+install_model(sys.argv[1], Path(sys.argv[2]))
+PY
+        then
+            return 0
+        fi
+
+        rm -f "$checkpoint_path"
+        if [[ "$attempt" -lt 3 ]]; then
+            sleep "$((attempt * 5))"
+        fi
+    done
+    return 1
+}}
+
+for checkpoint_index in "${{!required_models[@]}}"; do
+    model_name="${{required_models[$checkpoint_index]}}"
+    checkpoint_name="${{required_checkpoints[$checkpoint_index]}}"
+    checkpoint_path="$CHECKPOINT_DIR/$checkpoint_name"
+
+    if checkpoint_is_valid "$model_name" "$checkpoint_name"; then
+        echo "$checkpoint_name is already present and valid."
+        continue
+    fi
+
+    if [[ -e "$checkpoint_path" ]]; then
+        echo "Removing incomplete or invalid checkpoint: $checkpoint_path"
+        rm -f "$checkpoint_path"
+    fi
+    echo "Downloading $model_name to $CHECKPOINT_DIR over IPv4..."
+    if ! download_checkpoint_ipv4 "$model_name" "$CHECKPOINT_DIR" "$checkpoint_path"; then
+        # Foundry writes directly to the destination; do not leave a partial file
+        # that a later retry could mistake for a completed checkpoint.
+        rm -f "$checkpoint_path"
+        echo "Checkpoint download failed for $model_name." >&2
+        exit 1
+    fi
+    if ! checkpoint_is_valid "$model_name" "$checkpoint_name"; then
+        rm -f "$checkpoint_path"
+        echo "Checkpoint verification failed for $checkpoint_name." >&2
         exit 1
     fi
 done
 
-# Persist the verified absolute path both for interactive shells and for XCOP's
-# --export=NONE Slurm jobs, which all activate the rfdxcop Conda environment.
-FOUNDRY_BASHRC_EXPORT={shlex.quote(bashrc_export_line)}
-FOUNDRY_BASHRC_COMMENT={shlex.quote(bashrc_export_comment)}
-BASHRC_PATH="$HOME/.bashrc"
-touch "$BASHRC_PATH"
-if ! grep -Fqx -- "$FOUNDRY_BASHRC_EXPORT" "$BASHRC_PATH"; then
-    if [[ -s "$BASHRC_PATH" ]]; then
-        printf '\n' >> "$BASHRC_PATH"
-    fi
-    printf '%s\n%s\n' "$FOUNDRY_BASHRC_COMMENT" "$FOUNDRY_BASHRC_EXPORT" >> "$BASHRC_PATH"
-fi
-
-mkdir -p "$CONDA_PREFIX/etc/conda/activate.d"
-cat > "$CONDA_PREFIX/etc/conda/activate.d/xcop_foundry_checkpoints.sh" <<'XCOP_FOUNDRY_ENV'
-export FOUNDRY_CHECKPOINT_DIRS={quoted_checkpoint_dir}
-XCOP_FOUNDRY_ENV
-
+persist_checkpoint_exports
 echo "Foundry installation complete. Verified ${{#required_checkpoints[@]}} checkpoints in $CHECKPOINT_DIR."
-rm -f "install_foundry_${{SLURM_JOB_ID}}.log"
 '''
 
 
@@ -921,9 +1232,8 @@ class SetupWizard:
             self.root.after(0, lambda: self.skip_cuda_btn.pack_forget())
             
         elif ENV_NAME == "xcop" and not perform_scan:
-            self.log(">>> Skipped CUDA detection for AutoJPG per user request.")
-            # Provide base fallback so PyTorch still installs natively if environment is missing
-            PT_PKGS = ["pytorch", "torchvision"]
+            self.log(">>> AutoJPG not selected; skipping CUDA and PyTorch checks.")
+            PT_PKGS = []
             OPTIMAL_CUDA_VER = None
         else:
             # Instantly bypass the heavy internet check for bonus/custom environments
@@ -1012,8 +1322,7 @@ class SetupWizard:
         self.log(">>> Checking current setup status...")
         
         # 1. Check Conda Env & Packages
-        check_process = subprocess.run("conda env list", shell=True, stdout=subprocess.PIPE, text=True)
-        env_actually_exists = ENV_NAME in check_process.stdout
+        env_actually_exists = conda_environment_exists(ENV_NAME)
         base_env_exists = env_actually_exists
         
         if env_actually_exists:
@@ -1033,7 +1342,7 @@ class SetupWizard:
         NEEDS_PYTORCH = False
         PT_STATUS = "none"
         
-        if ENV_NAME == "xcop":
+        if ENV_NAME == "xcop" and self.autojpg_var.get():
             if env_actually_exists:
                 self.log(">>> Checking PyTorch installation status...")
                 pt_installed_check = subprocess.run(f"conda run -n {ENV_NAME} python -c \"import torch\"", shell=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
@@ -1055,6 +1364,40 @@ class SetupWizard:
                     self.log(">>> PyTorch not detected. Pending user confirmation.")
             else:
                 PT_STATUS = "none"
+
+        # RFdiffusion is an optional, independent environment. Its environment,
+        # packages, checkpoints, and shell exports must all be ready before Step 1
+        # can be considered complete.
+        foundry_status = None
+        if self.rfd_var.get():
+            self.log(">>> Checking RFdiffusion (rfdxcop) setup status...")
+            foundry_status = inspect_foundry_setup(SCRIPT_NAME)
+            if foundry_status["env_exists"]:
+                self.log(f">>> Conda environment '{FOUNDRY_ENV_NAME}' found.")
+                if foundry_status["packages_ok"]:
+                    self.log(">>> Required RFdiffusion packages found.")
+                else:
+                    self.log(">>> Required RFdiffusion packages are missing or incomplete.")
+            else:
+                self.log(f">>> Conda environment '{FOUNDRY_ENV_NAME}' not found.")
+
+            if foundry_status["checkpoints_ok"]:
+                self.log(">>> Required RFdiffusion checkpoints found.")
+            else:
+                self.log(
+                    ">>> Missing RFdiffusion checkpoints: "
+                    + ", ".join(foundry_status["missing_checkpoints"])
+                )
+
+            if foundry_status["bashrc_ok"]:
+                self.log(">>> RFdiffusion checkpoint path is correct in ~/.bashrc.")
+            else:
+                self.log(">>> RFdiffusion checkpoint path is missing or incorrect in ~/.bashrc.")
+
+            if foundry_status["activation_export_ok"]:
+                self.log(">>> RFdiffusion checkpoint path is correct on Conda activation.")
+            else:
+                self.log(">>> RFdiffusion Conda activation export is missing or incorrect.")
 
         # 2. Check Script Permissions
         perm_ok = False
@@ -1093,9 +1436,28 @@ class SetupWizard:
             except Exception:
                 pass
 
-        self.root.after(0, self.apply_initial_checks, env_actually_exists, base_env_exists, PT_STATUS, perm_ok, shebang_ok, bashrc_ok)
+        self.root.after(
+            0,
+            self.apply_initial_checks,
+            env_actually_exists,
+            base_env_exists,
+            PT_STATUS,
+            perm_ok,
+            shebang_ok,
+            bashrc_ok,
+            foundry_status,
+        )
 
-    def apply_initial_checks(self, env_actually_exists, base_env_exists, pt_status, perm_ok, shebang_ok, bashrc_ok):
+    def apply_initial_checks(
+        self,
+        env_actually_exists,
+        base_env_exists,
+        pt_status,
+        perm_ok,
+        shebang_ok,
+        bashrc_ok,
+        foundry_status,
+    ):
         global NEEDS_PYTORCH
         
         env_exists = base_env_exists
@@ -1114,6 +1476,16 @@ class SetupWizard:
                 NEEDS_PYTORCH = False
                 env_exists = base_env_exists
                 self.log(">>> AutoJPG deep learning packages skipped by user.")
+
+        if self.rfd_var.get() and foundry_status and not foundry_status["ready"]:
+            env_exists = False
+            repairs = ", ".join(describe_foundry_repairs(foundry_status))
+            self.log(
+                ">>> RFdiffusion repair required; Step 1 marked incomplete: "
+                f"{repairs}."
+            )
+        elif self.rfd_var.get() and foundry_status:
+            self.log(">>> RFdiffusion environment, checkpoints, and exports are ready.")
         
         self.update_info_panel()
 
@@ -1138,7 +1510,10 @@ class SetupWizard:
                         self.log(">>> PATH already in ~/.bashrc.")
         
         if len(self.completed_steps["setup"]) == 0:
-            self.log(">>> No existing setup found. Ready to install.")
+            if base_env_exists:
+                self.log(">>> Base environment found, but optional components need installation or repair.")
+            else:
+                self.log(">>> No complete existing setup found. Ready to install.")
             
         self.update_checklist_ui()
         
@@ -1162,15 +1537,15 @@ class SetupWizard:
         
         # 1. Check ~/.bashrc
         bashrc_path = os.path.expanduser("~/.bashrc")
-        script_dir = os.path.dirname(SCRIPT_NAME)
-        exact_comment = f"# Added by {ENV_NAME} setup wizard: export PATH={script_dir}:$PATH"
         bashrc_has_path = False
+        managed_entries = build_uninstall_bashrc_entries(SCRIPT_NAME, ENV_NAME)
+        managed_comments = {comment for comment, _command in managed_entries}
         
         if os.path.exists(bashrc_path):
             try:
                 with open(bashrc_path, "r") as f:
                     for line in f:
-                        if exact_comment in line:
+                        if line.strip() in managed_comments:
                             bashrc_has_path = True
                             break
             except Exception:
@@ -1178,7 +1553,7 @@ class SetupWizard:
                 
         # 2. Check Conda Env
         check_process = subprocess.run("conda env list", shell=True, stdout=subprocess.PIPE, text=True)
-        env_exists = ENV_NAME in check_process.stdout
+        env_exists = conda_environment_exists(ENV_NAME)
         
         env_list = []
         for line in check_process.stdout.split('\n'):
@@ -1464,6 +1839,8 @@ class SetupWizard:
         if selected_env and selected_env != ENV_NAME:
             ENV_NAME = selected_env
             self.log(f"\n>>> Target uninstall environment changed to: {ENV_NAME}")
+            if ENV_NAME == FOUNDRY_ENV_NAME:
+                self.log(">>> Only rfdxcop will be removed; the xcop environment will be kept.")
             self.update_customize_btn_visuals()
             self.update_info_panel()
             
@@ -2273,6 +2650,18 @@ class SetupWizard:
 
     def run_command(self, cmd, cwd=None):
         """Executes a shell command and logs its output continuously."""
+        captured_lines = []
+        self.last_command_output = ""
+
+        def emit(line, replace_last=False):
+            self.log(line, replace_last=replace_last)
+            if replace_last and captured_lines:
+                captured_lines[-1] = line
+            else:
+                captured_lines.append(line)
+            if len(captured_lines) > 500:
+                del captured_lines[:-500]
+
         self.log(f"\n>>> Executing: {cmd}")
         if cwd:
             self.log(f">>> Working directory: {cwd}")
@@ -2297,24 +2686,25 @@ class SetupWizard:
             char = process.stdout.read(1).decode('utf-8', errors='replace')
             if not char and process.poll() is not None:
                 if current_line:
-                    self.log(current_line, replace_last=last_was_cr)
+                    emit(current_line, replace_last=last_was_cr)
                 break
                 
             # Conda uses \r for progress bars and \b for the ...working... spinner
             if char in ['\r', '\b']: 
                 if current_line.strip():
-                    self.log(current_line, replace_last=last_was_cr)
+                    emit(current_line, replace_last=last_was_cr)
                     last_was_cr = True
                 current_line = ""
             elif char == '\n': 
                 if current_line.strip():
-                    self.log(current_line, replace_last=last_was_cr)
+                    emit(current_line, replace_last=last_was_cr)
                 last_was_cr = False
                 current_line = ""
             else:
                 current_line += char
                 
         process.wait()
+        self.last_command_output = "\n".join(captured_lines)
         return process.returncode == 0
 
     def fail_setup_step(self, title, message):
@@ -2386,9 +2776,7 @@ class SetupWizard:
         install_success = True
 
         self.log(f"Checking for existing '{ENV_NAME}' environment...")
-        check_process = subprocess.run("conda env list", shell=True, stdout=subprocess.PIPE, text=True)
-        
-        if ENV_NAME in check_process.stdout:
+        if conda_environment_exists(ENV_NAME):
             self.log(f"\n>>> Environment '{ENV_NAME}' already exists! Skipping creation.")
             self.log(">>> Checking which packages are missing to avoid unnecessary solver overhead...")
             
@@ -2442,69 +2830,80 @@ class SetupWizard:
 
         # Install RFdiffusion if selected
         if self.rfd_var.get():
-            self.log(f"\n>>> Installing Foundry environment ({FOUNDRY_ENV_NAME})...")
-            if conda_environment_exists(FOUNDRY_ENV_NAME):
-                self.log(
-                    f">>> Conda environment '{FOUNDRY_ENV_NAME}' already exists; "
-                    "reusing it and repairing any missing installation files."
-                )
-            else:
-                rfd_cmd = f"conda create -n {FOUNDRY_ENV_NAME} python=3.12 -y"
-                if not self.run_command(rfd_cmd):
-                    self.fail_setup_step(
-                        "Foundry Environment Creation Failed",
-                        f"Could not create the '{FOUNDRY_ENV_NAME}' Conda environment. "
-                        "The checkpoint installation was not submitted.",
-                    )
-                    return
-
             script_dir = os.path.dirname(SCRIPT_NAME)
             xcop_savings_dir = os.path.abspath(os.path.join(script_dir, "xcop_savings"))
             checkpoint_dir = os.path.abspath(
                 os.path.join(xcop_savings_dir, "foundry", "checkpoints")
             )
-            os.makedirs(checkpoint_dir, exist_ok=True)
-
-            slurm_script_path = os.path.join(xcop_savings_dir, "install_foundry.sh")
-            slurm_content = build_foundry_install_slurm_script(checkpoint_dir)
-            with open(slurm_script_path, "w", newline="\n") as handle:
-                handle.write(slurm_content)
-
-            self.log(">>> Submitting Foundry installation to Slurm and waiting for verification...")
-            self.log(
-                ">>> The Foundry package installation and checkpoint downloads run "
-                "inside the Slurm job; once submitted, they continue independently "
-                "if this setup window is closed."
-            )
-            install_success = self.run_command(
-                "sbatch --wait install_foundry.sh",
-                cwd=xcop_savings_dir,
-            )
-            if not install_success:
-                self.fail_setup_step(
-                    "Foundry Installation Failed",
-                    "The Foundry Slurm job failed. XCOP kept install_foundry.sh and "
-                    f"install_foundry_<job-id>.log in {xcop_savings_dir} for diagnosis.",
+            foundry_status = inspect_foundry_setup(SCRIPT_NAME)
+            if foundry_status["ready"]:
+                self.log(
+                    f"\n>>> RFdiffusion setup is already complete in "
+                    f"'{FOUNDRY_ENV_NAME}'; no Slurm repair job is needed."
                 )
-                return
+            else:
+                repairs = ", ".join(describe_foundry_repairs(foundry_status))
+                self.log(f"\n>>> RFdiffusion components to repair: {repairs}.")
+                os.makedirs(checkpoint_dir, exist_ok=True)
 
-            missing_checkpoints = [
-                filename
-                for filename in FOUNDRY_CHECKPOINT_FILENAMES
-                if not os.path.isfile(os.path.join(checkpoint_dir, filename))
-                or os.path.getsize(os.path.join(checkpoint_dir, filename)) == 0
-            ]
-            if missing_checkpoints:
-                self.fail_setup_step(
-                    "Foundry Checkpoint Verification Failed",
-                    f"The Slurm job finished, but these checkpoints are missing from "
-                    f"{checkpoint_dir}: {', '.join(missing_checkpoints)}",
+                slurm_script_path = os.path.join(xcop_savings_dir, "install_foundry.sh")
+                slurm_content = build_foundry_install_slurm_script(checkpoint_dir)
+                with open(slurm_script_path, "w", newline="\n") as handle:
+                    handle.write(slurm_content)
+
+                self.log(">>> Submitting the RFdiffusion repair script to Slurm...")
+                self.log(
+                    ">>> The job creates rfdxcop if needed, installs only missing "
+                    "packages, downloads only missing checkpoints, and repairs both "
+                    "checkpoint-path exports."
                 )
-                return
+                install_success = self.run_command(
+                    "sbatch --wait install_foundry.sh",
+                    cwd=xcop_savings_dir,
+                )
+                if not install_success:
+                    sbatch_output = getattr(self, "last_command_output", "")
+                    job_id = extract_sbatch_job_id(sbatch_output)
+                    diagnostics = read_foundry_slurm_diagnostics(
+                        xcop_savings_dir, sbatch_output
+                    )
+                    if diagnostics:
+                        diagnostic_message = (
+                            "\n\nSlurm diagnostics:\n" + diagnostics
+                        )
+                    elif job_id:
+                        diagnostic_message = (
+                            f"\n\nNo readable job log was found yet for job {job_id}. "
+                            f"Check install_foundry_{job_id}.log, "
+                            f"install_foundry_{job_id}.err, and slurm-{job_id}.out "
+                            f"in {xcop_savings_dir}."
+                        )
+                    else:
+                        diagnostic_message = (
+                            f"\n\nCheck install_foundry_<job-id>.log and "
+                            f"install_foundry_<job-id>.err in {xcop_savings_dir}."
+                        )
+                    self.fail_setup_step(
+                        "RFdiffusion Repair Failed",
+                        "The RFdiffusion Slurm job failed. XCOP kept the repair script "
+                        "and job logs for diagnosis."
+                        + diagnostic_message,
+                    )
+                    return
 
-            self.log(
-                f">>> Foundry installation verified successfully in {checkpoint_dir}."
-            )
+                verified_status = inspect_foundry_setup(SCRIPT_NAME)
+                if not verified_status["ready"]:
+                    remaining = ", ".join(describe_foundry_repairs(verified_status))
+                    self.fail_setup_step(
+                        "RFdiffusion Verification Failed",
+                        "The Slurm job finished, but setup verification still reports: "
+                        f"{remaining}.",
+                    )
+                    return
+
+                self.log(
+                    f">>> RFdiffusion setup verified successfully in {checkpoint_dir}."
+                )
 
         # Tell the script the PyTorch requirement is satisfied and refresh the UI panel
         NEEDS_PYTORCH = False
@@ -2614,9 +3013,7 @@ class SetupWizard:
         if do_backup and os.path.exists(bashrc_path):
             self.backup_bashrc(bashrc_path, script_dir)
 
-        include_foundry = self.rfd_var.get() or os.path.exists(
-            os.path.join(script_dir, "xcop_savings", "foundry")
-        )
+        include_foundry = self.rfd_var.get()
         entries = build_xcop_bashrc_entries(
             SCRIPT_NAME,
             ENV_NAME,
@@ -2750,14 +3147,13 @@ class SetupWizard:
     # ==================== UNINSTALL MODE ====================
 
     def execute_uninstall_step_1(self, do_backup):
-        self.log("--- Uninstall Step 1: Removing PATH from ~/.bashrc ---")
+        if ENV_NAME == FOUNDRY_ENV_NAME:
+            self.log("--- Uninstall Step 1: Removing RFdiffusion export from ~/.bashrc ---")
+        else:
+            self.log("--- Uninstall Step 1: Removing PATH from ~/.bashrc ---")
         
         bashrc_path = os.path.expanduser("~/.bashrc")
-        entries = build_xcop_bashrc_entries(
-            SCRIPT_NAME,
-            ENV_NAME,
-            include_foundry=True,
-        )
+        entries = build_uninstall_bashrc_entries(SCRIPT_NAME, ENV_NAME)
         
         if not os.path.exists(bashrc_path):
             self.log(f">>> {bashrc_path} does not exist. Nothing to remove.")
@@ -2784,6 +3180,8 @@ class SetupWizard:
         if ENV_NAME == "xcop":
             self.log(f"--- Removing Conda Environment 'rfdxcop' ---")
             self.run_command(f"conda remove -n rfdxcop --all -y")
+        elif ENV_NAME == FOUNDRY_ENV_NAME:
+            self.log(">>> Kept the 'xcop' Conda environment unchanged.")
         self.root.after(0, self.finish_step, 3, "Uninstall Complete", True)
         self.root.after(100, self.check_uninstall_status)
 
