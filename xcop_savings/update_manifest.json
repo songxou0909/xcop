@@ -38,7 +38,7 @@
     },
     {
       "path": "xcop_savings/modifier.py",
-      "sha256": "8159dcb58e785f4018c7aed74454d66ac5ff6bf15f8b317b725ce3d94ba90800"
+      "sha256": "17c469bc459ac079ec78da3fa5dce7f1cadc7d8211972b54f5e91ce0fd11cfcd"
     },
     {
       "path": "xcop_savings/queue_monitor.py",
@@ -70,7 +70,7 @@
     },
     {
       "path": "xcop_setup.py",
-      "sha256": "7ba82b89416fda08e2b9497791f0dec447307bc9043a85e9ec5264491b0cbe46"
+      "sha256": "d16a317b7a51996afd7c7d46668184085e9f3a6d3e59391ffc3ea6f325957930"
     }
   ]
 }
