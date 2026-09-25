@@ -181,11 +181,11 @@ XCOP_ROOT = Path(__file__).resolve().parent
 
 ENV_NAME = "xcop"
 SCRIPT_NAME = str(XCOP_ROOT / "xcop")
-PACKAGES = ["pyqt6", "matplotlib", "numpy", "mrcfile", "scikit-learn", "pyqtgraph", "PyOpenGL", "biopython"]
+PACKAGES = ["pyqt6", "matplotlib", "numpy", "mrcfile", "scikit-learn", "pyqtgraph", "PyOpenGL", "biopython", "gemmi"]
 
 DEFAULT_ENV = "xcop"
 DEFAULT_SCRIPT = str(XCOP_ROOT / "xcop")
-DEFAULT_PACKAGES = ["pyqt6", "matplotlib", "numpy", "mrcfile", "scikit-learn", "pyqtgraph", "PyOpenGL", "biopython"]
+DEFAULT_PACKAGES = ["pyqt6", "matplotlib", "numpy", "mrcfile", "scikit-learn", "pyqtgraph", "PyOpenGL", "biopython", "gemmi"]
 
 UPDATE_REPOSITORY = "songxou0909/xcop"
 UPDATE_BRANCH = "main"
@@ -1629,7 +1629,7 @@ class SetupWizard:
         
         content = [
             ("1. Create environment:\n", ""),
-            ("conda create --name xcop\nconda activate xcop\nconda install -c conda-forge pyqt6 matplotlib numpy mrcfile scikit-learn pyqtgraph PyOpenGL\n\n", "code"),
+            ("conda create --name xcop\nconda activate xcop\nconda install -c conda-forge pyqt6 matplotlib numpy mrcfile scikit-learn pyqtgraph PyOpenGL gemmi\n\n", "code"),
             
             ("2. Change permission of the script (xcop): \n", ""),
             ("chmod 750 xcop\n\n", "code"),
