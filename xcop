@@ -223,11 +223,11 @@ current_canvas = None  # Global variable to hold the active canvas
 MAIN_SIZE = (345, 410)
 
 # External packages versions
-RELION_VER = "relion/5.1_gpu_ompi4_cuda111"
-XMIPP_VER = "xmipp/2.4"
-SERVALCAT_VER = "servalcat/0.4.105"
-PHENIX_VER = "phenix/1.20.1"
-CHIMERA_VER = "chimera/1.16"
+RELION_VER = ""
+XMIPP_VER = ""
+SERVALCAT_VER = ""
+PHENIX_VER = ""
+CHIMERA_VER = ""
 
 # Use the directory where the script is located
 base_path = os.path.dirname(__file__)
@@ -1303,15 +1303,25 @@ def open_filelist_separation_window(auto_jpg_path=None):
         jpg_folder_entry.setText(last_separate_movies_inputs[0])
     layout.addWidget(jpg_folder_entry, 0, 1)
 
-    btn_browse_jpg = QPushButton("Browse File/Folder")
-    def browse_filelist():
+    browse_jpg_layout = QHBoxLayout()
+    
+    btn_browse_file = QPushButton("Browse File")
+    def browse_file():
         path, _ = QFileDialog.getOpenFileName(filelist_window, "Select Filelist", os.getcwd(), "All Files (*);;Text Files (*.txt)")
-        if not path:
-            path = QFileDialog.getExistingDirectory(filelist_window, "Select JPG Folder")
         if path:
             jpg_folder_entry.setText(path)
-    btn_browse_jpg.clicked.connect(browse_filelist)
-    layout.addWidget(btn_browse_jpg, 0, 2)
+    btn_browse_file.clicked.connect(browse_file)
+    
+    btn_browse_folder = QPushButton("Browse Folder")
+    def browse_folder():
+        path = QFileDialog.getExistingDirectory(filelist_window, "Select JPG Folder", os.getcwd())
+        if path:
+            jpg_folder_entry.setText(path)
+    btn_browse_folder.clicked.connect(browse_folder)
+    
+    browse_jpg_layout.addWidget(btn_browse_file)
+    browse_jpg_layout.addWidget(btn_browse_folder)
+    layout.addLayout(browse_jpg_layout, 0, 2)
 
     # Row 1: Movies Folder
     label_movies = QLabel("Movies Folder (EERs):")
