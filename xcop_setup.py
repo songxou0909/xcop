@@ -734,8 +734,8 @@ def normalize_update_script_bytes(data):
     return data.replace(b"\r\n", b"\n")
 
 
-def canonicalize_update_script_for_hash(data, preserve_rules=None):
-    """Remove installation-specific values before hashing an update script."""
+def _normalize_preserved_script_settings(data, preserve_rules, software_version_value):
+    """Normalize line endings and replace installation-specific settings."""
     canonical_data = normalize_update_script_bytes(data)
     preserve_rules = set(preserve_rules or [])
     if not preserve_rules:
@@ -759,7 +759,7 @@ def canonicalize_update_script_for_hash(data, preserve_rules=None):
                 flags=re.MULTILINE,
             )
             script_text, replacement_count = assignment_pattern.subn(
-                f'{name} = "__XCOP_PRESERVED_VALUE__"',
+                f'{name} = {json.dumps(software_version_value)}',
                 script_text,
                 count=1,
             )
@@ -769,6 +769,18 @@ def canonicalize_update_script_for_hash(data, preserve_rules=None):
                 )
 
     return script_text.encode("utf-8")
+
+
+def canonicalize_update_script_for_hash(data, preserve_rules=None):
+    """Remove installation-specific values before hashing an update script."""
+    return _normalize_preserved_script_settings(
+        data, preserve_rules, "__XCOP_PRESERVED_VALUE__"
+    )
+
+
+def clean_update_script_for_publication(data, preserve_rules):
+    """Remove local shebangs and clear configured software selections."""
+    return _normalize_preserved_script_settings(data, preserve_rules, "")
 
 
 def update_script_sha256(data, preserve_rules=None):
@@ -803,46 +815,43 @@ def discover_update_scripts(root=None):
                 continue
 
             relative_path = script_path.relative_to(root).as_posix()
-            entry = {"path": relative_path}
-            preserve_rules = []
-            if script_has_shebang(script_path):
-                preserve_rules.append("shebang")
-            if (
-                relative_path == "xcop_savings/queue_monitor.py"
-                and "shebang" not in preserve_rules
-            ):
-                preserve_rules.append("shebang")
-            if preserve_rules:
-                entry["preserve"] = preserve_rules
+            # Keep this rule even after publishing cleanup removes the shebang.
+            entry = {"path": relative_path, "preserve": ["shebang"]}
             if relative_path == "xcop_savings/queue_monitor.py":
                 entry["executable"] = True
             scripts.append(entry)
 
     setup_script = root / "xcop_setup.py"
     if setup_script.is_file():
-        entry = {"path": "xcop_setup.py"}
-        if script_has_shebang(setup_script):
-            entry["preserve"] = ["shebang"]
-        scripts.append(entry)
+        scripts.append({"path": "xcop_setup.py", "preserve": ["shebang"]})
 
     return scripts
 
 
-def generate_update_manifest(root=None):
-    """Regenerate the checked update manifest after publishing script changes."""
+def generate_update_manifest(root=None, *, clean=False):
+    """Generate checksums, optionally cleaning source files for publication."""
     root = Path(root) if root else get_xcop_root()
     scripts = []
+    pending_writes = []
     for rule in discover_update_scripts(root):
         entry = dict(rule)
         script_path = root / PurePosixPath(rule["path"])
         script_data = script_path.read_bytes()
-        lf_script_data = normalize_update_script_bytes(script_data)
-        if lf_script_data != script_data:
-            script_path.write_bytes(lf_script_data)
+        preserve_rules = rule.get("preserve", [])
+        if clean:
+            prepared_data = clean_update_script_for_publication(script_data, preserve_rules)
+            try:
+                compile(prepared_data, str(script_path), "exec")
+            except (SyntaxError, ValueError) as exc:
+                raise UpdateError(f"Cannot publish invalid Python script {rule['path']}: {exc}") from exc
+        else:
+            prepared_data = normalize_update_script_bytes(script_data)
         entry["sha256"] = update_script_sha256(
-            lf_script_data,
-            rule.get("preserve", []),
+            prepared_data,
+            preserve_rules,
         )
+        if prepared_data != script_data:
+            pending_writes.append((script_path, prepared_data))
         scripts.append(entry)
 
     manifest = {
@@ -851,6 +860,9 @@ def generate_update_manifest(root=None):
         "branch": UPDATE_BRANCH,
         "scripts": scripts,
     }
+    # Validate every script before changing any source file.
+    for script_path, prepared_data in pending_writes:
+        script_path.write_bytes(prepared_data)
     manifest_path = root / PurePosixPath(UPDATE_MANIFEST_PATH)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_bytes((json.dumps(manifest, indent=2) + "\n").encode("utf-8"))
