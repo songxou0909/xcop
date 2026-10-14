@@ -419,6 +419,39 @@ def build_slurm_submit_command(submit_script, dependency_job_id=None):
     return command
 
 
+def iteration_backbone_batches(pwd):
+    """Return copied backbone batch IDs, or None for a normal workspace.
+
+    Recognize existing iteration workspaces without requiring new metadata.
+    Copied backbone names also identify an iteration after its folder is renamed.
+    """
+    import re
+
+    is_iteration = bool(re.search(
+        r"_Passed_Binders_Iteration\d+$", os.path.basename(os.path.normpath(pwd))
+    ))
+    batches = []
+    backbone_dir = os.path.join(pwd, "rfd3_outputs")
+    if os.path.isdir(backbone_dir):
+        with os.scandir(backbone_dir) as entries:
+            for entry in entries:
+                if (
+                    not re.fullmatch(r"batch_(0|[1-9]\d*)", entry.name)
+                    or not entry.is_dir()
+                ):
+                    continue
+                with os.scandir(entry.path) as files:
+                    cif_names = [
+                        file.name for file in files
+                        if file.is_file() and file.name.endswith(".cif")
+                    ]
+                if any(name.startswith("Passed_Binder_") for name in cif_names):
+                    is_iteration = True
+                if cif_names:
+                    batches.append(int(entry.name.split("_", 1)[1]))
+    return sorted(batches) if is_iteration else None
+
+
 # 1. Catch the arguments passed by xcop.py
 parser = argparse.ArgumentParser()
 parser.add_argument("--chimera-ver", type=str, default="chimera")
@@ -3709,7 +3742,8 @@ rc("close session")
             self.btn_auto_run.setObjectName("autoRunButton")
             self.btn_auto_run.setToolTip(
                 "Submit RFD3, MPNN, RF3, and CPU validation using the "
-                "currently displayed parameters. Each stage starts only "
+                "currently displayed parameters. Iteration workspaces reuse "
+                "their backbones and start at MPNN. Each stage starts only "
                 "after the preceding SLURM array succeeds."
             )
             self.btn_auto_run.clicked.connect(self.auto_run_pipeline)
@@ -4655,8 +4689,8 @@ rc("close session")
             return invalidated
 
         def apply_workflow_availability(self, pwd, tracker=None):
-            # Workflow state affects styling only. Sections are never locked
-            # merely because an earlier section is unfinished.
+            # Other sections remain usable regardless of earlier progress;
+            # iterations explicitly skip backbone generation.
             for button in (
                 self.btn_run_rfd3,
                 self.btn_run_mpnn,
@@ -4677,6 +4711,21 @@ rc("close session")
                 "COMPLETING", "RESIZING", "REQUEUED", "REQUEUE_FED",
                 "SUSPENDED",
             }
+            try:
+                is_iteration = iteration_backbone_batches(pwd) is not None
+            except OSError:
+                is_iteration = self.btn_run_rfd3.property("job_state") == "SKIPPED"
+            if (
+                is_iteration
+                and self.get_step_status(pwd, "rfd3", tracker) not in active_states
+            ):
+                self.update_button_state(self.btn_run_rfd3, "SKIPPED", "Run RFD3")
+                self.btn_run_rfd3.setToolTip(
+                    "This iteration reuses the passed backbones. Start from MPNN."
+                )
+            elif not is_iteration and self.btn_run_rfd3.property("job_state") == "SKIPPED":
+                self.reset_button_style(self.btn_run_rfd3, "Run RFD3")
+
             pipeline_active = any(
                 self.get_step_status(pwd, step_name, tracker) in active_states
                 for step_name in ("rfd3", "mpnn", "rf3", "validation")
@@ -4744,7 +4793,14 @@ rc("close session")
 
             button.setProperty("job_state", state)
             font_weight = "bold"
-            if state == "RUNNING":
+            if state == "SKIPPED":
+                button.setText("Skipped")
+                button.setStyleSheet(
+                    "background-color: #5c5c5c; color: #aaaaaa; "
+                    f"font-weight: {font_weight};"
+                )
+                button.setEnabled(False)
+            elif state == "RUNNING":
                 button.setText("Running")
                 button.setStyleSheet(
                     "background-color: #5c5c5c; color: #aaaaaa; "
@@ -5335,8 +5391,33 @@ rc("close session")
             self.execute_command(["sbatch", "scripts/submit_rfd3.sh"], pwd, "RFD3 Job Submitted Successfully.", "rfd3", self.btn_run_rfd3, "Run RFD3")
 
         def auto_run_pipeline(self):
-            """Submit all four compute stages as an afterok dependency chain."""
-            if not getattr(self.mol_canvas, 'selected_indices', set()):
+            """Submit compute stages, reusing passed backbones for iterations."""
+            pwd = self._check_workspace()
+            if not pwd:
+                return
+
+            try:
+                iteration_batches = iteration_backbone_batches(pwd)
+            except OSError as error:
+                QMessageBox.critical(
+                    self, "Dependency Error",
+                    f"Could not read the workspace backbones:\n{error}",
+                )
+                return
+            reuse_backbones = iteration_batches is not None
+            if reuse_backbones and not iteration_batches:
+                QMessageBox.critical(
+                    self, "Dependency Error",
+                    "No backbone CIF files were found in this iteration's "
+                    "rfd3_outputs/batch_* folders. Restore the passed backbones "
+                    "before starting Auto Run.",
+                )
+                return
+
+            if (
+                not reuse_backbones
+                and not getattr(self.mol_canvas, 'selected_indices', set())
+            ):
                 self.right_tabs.setCurrentIndex(0)
                 QMessageBox.warning(
                     self,
@@ -5345,10 +5426,6 @@ rc("close session")
                     "atoms before starting Auto Run.\n\nUsually, select only "
                     "carbon atoms.",
                 )
-                return
-
-            pwd = self._check_workspace()
-            if not pwd:
                 return
 
             self.btn_auto_run.setText("Submitting...")
@@ -5361,23 +5438,31 @@ rc("close session")
                 import subprocess
                 import time
 
-                input_json = self.generate_json_file(show_success=False)
-                if not input_json or not os.path.exists(input_json):
-                    return
+                if reuse_backbones:
+                    array_limit = max(iteration_batches)
+                else:
+                    input_json = self.generate_json_file(show_success=False)
+                    if not input_json or not os.path.exists(input_json):
+                        return
 
-                array_limit = max(0, self.num_batches_spin.value() - 1)
-                self._write_rfd3_scripts(
-                    pwd,
-                    input_json,
-                    self.num_designs_spin.value(),
-                    1,
-                    array_limit,
-                )
+                    array_limit = max(0, self.num_batches_spin.value() - 1)
+                    self._write_rfd3_scripts(
+                        pwd,
+                        input_json,
+                        self.num_designs_spin.value(),
+                        1,
+                        array_limit,
+                    )
                 self._write_mpnn_scripts(
-                    pwd, self.seqs_per_struct_spin.value(), array_limit
+                    pwd, self.seqs_per_struct_spin.value(), array_limit,
+                    batch_ids=iteration_batches,
                 )
-                self._write_rf3_scripts(pwd, array_limit)
-                self._write_validation_scripts(pwd, array_limit)
+                self._write_rf3_scripts(
+                    pwd, array_limit, batch_ids=iteration_batches
+                )
+                self._write_validation_scripts(
+                    pwd, array_limit, batch_ids=iteration_batches
+                )
 
                 stages = (
                     (
@@ -5398,6 +5483,8 @@ rc("close session")
                         "Run CPU Validation Array",
                     ),
                 )
+                if reuse_backbones:
+                    stages = stages[1:]
 
                 tracker = self.load_job_tracker(pwd)
                 parameters = self.get_current_job_parameters()
@@ -5416,7 +5503,7 @@ rc("close session")
                     )
                     job_id = parse_slurm_job_id(result.stdout)
 
-                    if step_name == "rfd3":
+                    if dependency_job_id is None:
                         self.invalidate_downstream_jobs(tracker, step_name)
 
                     submit_path = os.path.join(pwd, submit_script)
@@ -5464,10 +5551,16 @@ rc("close session")
                     f"{step_name.upper()}: {job_id}"
                     for step_name, job_id in submitted
                 )
+                start_message = (
+                    "Existing backbones are being reused. MPNN is running. "
+                    "RF3 and CPU validation are "
+                    if reuse_backbones else
+                    "RFD3 is running. MPNN, RF3, and CPU validation are "
+                )
                 QMessageBox.information(
                     self,
                     "Auto Run Submitted",
-                    "RFD3 is running. MPNN, RF3, and CPU validation are "
+                    start_message +
                     "scheduled with SLURM afterok dependencies. If a stage "
                     "fails, its dependent jobs are cancelled.\n\n"
                     f"{job_summary}",
@@ -5818,6 +5911,9 @@ rc("close session")
                 return
 
             rfd3_output_dir = os.path.join(new_workspace, "rfd3_outputs")
+            parameters = self.get_current_job_parameters()
+            parameters["num_batches"] = len(unique_batches)
+            parameters["generated_json_path"] = ""
             created_workspace = False
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
@@ -5839,6 +5935,26 @@ rc("close session")
                     )
                     shutil.copy2(design["source"], destination)
                     copied_destinations.add(destination)
+
+                # Keep the target and selected hotspot atoms available when the
+                # new workspace is loaded, including after the app is restarted.
+                target_path = parameters.get("input_pdb", "")
+                if target_path and os.path.isfile(target_path):
+                    target_copy = os.path.join(
+                        new_workspace, os.path.basename(target_path)
+                    )
+                    shutil.copy2(target_path, target_copy)
+                    parameters["input_pdb"] = target_copy
+
+                import json, time
+                state_path = self.get_project_state_path(new_workspace)
+                os.makedirs(os.path.dirname(state_path), exist_ok=True)
+                with open(state_path, "w") as handle:
+                    json.dump({
+                        "schema_version": 1,
+                        "saved_at": time.time(),
+                        "parameters": parameters,
+                    }, handle, indent=4)
             except (OSError, shutil.Error) as error:
                 cleanup_failed = False
                 if created_workspace:
@@ -5866,7 +5982,8 @@ rc("close session")
                 f"Prepared {len(copied_destinations)} passed backbone(s) from "
                 f"{len(designs)} successful design(s) in "
                 f"{len(unique_batches)} RFD3 batch folder(s).\n\n"
-                "Continue from Section 2: MPNN Sequence Design.",
+                "Use Auto Run to start from MPNN with these backbones, or "
+                "continue manually from Section 2: MPNN Sequence Design.",
             )
 
         def start_local_extraction(self, pwd):
@@ -5997,7 +6114,11 @@ rc("close session")
             slurm_rfd3_code = f'''#!/bin/bash\n#SBATCH --job-name=rfd3_gen\n#SBATCH --output=logs/%x_%A_%a.out\n#SBATCH --error=logs/%x_%A_%a.err\n#SBATCH --ntasks=1\n#SBATCH --cpus-per-task=4\n#SBATCH --mem=32G\n#SBATCH --time=24:00:00\n#SBATCH --partition=normal\n#SBATCH --gres=gpu:1\n#SBATCH --array=0-{array_limit}%8\n#SBATCH --export=NONE\n\nset -eo pipefail\n\nmkdir -p logs\neval "$(conda shell.bash hook)"\nconda activate rfdxcop\n\npython scripts/run_rfd3.py \\\n        --input_json "{input_json}" \\\n        --num_designs {num_designs} \\\n        --batch_size {batch_size} \\\n        --out_dir ./rfd3_outputs/batch_${{SLURM_ARRAY_TASK_ID}}\n\nfind ./rfd3_outputs/batch_${{SLURM_ARRAY_TASK_ID}} -name "*.gz" -exec gunzip -f {{}} +\n'''
             with open(os.path.join(base_dir, "scripts", "submit_rfd3.sh"), "w") as f: f.write(slurm_rfd3_code)
 
-        def _write_mpnn_scripts(self, base_dir, seqs_per_struct, array_limit):
+        def _write_mpnn_scripts(self, base_dir, seqs_per_struct, array_limit, batch_ids=None):
+            array_spec = (
+                ",".join(str(batch_id) for batch_id in batch_ids)
+                if batch_ids is not None else f"0-{array_limit}"
+            )
             run_mpnn_code = '''import argparse
 import glob
 import os
@@ -6100,10 +6221,14 @@ input_configs = [
 MPNNInferenceEngine(**engine_config).run(input_dicts=input_configs)
 '''
             with open(os.path.join(base_dir, "scripts", "run_mpnn.py"), "w") as f: f.write(run_mpnn_code)
-            slurm_mpnn_code = f'''#!/bin/bash\n#SBATCH --job-name=mpnn_seq\n#SBATCH --output=logs/%x_%A_%a.out\n#SBATCH --error=logs/%x_%A_%a.err\n#SBATCH --ntasks=1\n#SBATCH --cpus-per-task=2\n#SBATCH --mem=16G\n#SBATCH --time=04:00:00\n#SBATCH --partition=normal\n#SBATCH --gres=gpu:1\n#SBATCH --array=0-{array_limit}%8\n#SBATCH --export=NONE\n\nset -eo pipefail\n\neval "$(conda shell.bash hook)"\nconda activate rfdxcop\n\nCURRENT_INPUT_DIR="./rfd3_outputs/batch_${{SLURM_ARRAY_TASK_ID}}"\nCURRENT_OUTPUT_DIR="./mpnn_outputs/batch_${{SLURM_ARRAY_TASK_ID}}"\nmkdir -p $CURRENT_OUTPUT_DIR\n\npython scripts/run_mpnn.py --input_dir $CURRENT_INPUT_DIR --out_dir $CURRENT_OUTPUT_DIR --seqs_per_struct {seqs_per_struct}\n\nsed -i "s/ \\[\\]$/ '[]'/g" $CURRENT_OUTPUT_DIR/*.cif\n'''
+            slurm_mpnn_code = f'''#!/bin/bash\n#SBATCH --job-name=mpnn_seq\n#SBATCH --output=logs/%x_%A_%a.out\n#SBATCH --error=logs/%x_%A_%a.err\n#SBATCH --ntasks=1\n#SBATCH --cpus-per-task=2\n#SBATCH --mem=16G\n#SBATCH --time=04:00:00\n#SBATCH --partition=normal\n#SBATCH --gres=gpu:1\n#SBATCH --array={array_spec}%8\n#SBATCH --export=NONE\n\nset -eo pipefail\n\neval "$(conda shell.bash hook)"\nconda activate rfdxcop\n\nCURRENT_INPUT_DIR="./rfd3_outputs/batch_${{SLURM_ARRAY_TASK_ID}}"\nCURRENT_OUTPUT_DIR="./mpnn_outputs/batch_${{SLURM_ARRAY_TASK_ID}}"\nmkdir -p $CURRENT_OUTPUT_DIR\n\npython scripts/run_mpnn.py --input_dir $CURRENT_INPUT_DIR --out_dir $CURRENT_OUTPUT_DIR --seqs_per_struct {seqs_per_struct}\n\nsed -i "s/ \\[\\]$/ '[]'/g" $CURRENT_OUTPUT_DIR/*.cif\n'''
             with open(os.path.join(base_dir, "scripts", "submit_mpnn.sh"), "w") as f: f.write(slurm_mpnn_code)
 
-        def _write_rf3_scripts(self, base_dir, array_limit):
+        def _write_rf3_scripts(self, base_dir, array_limit, batch_ids=None):
+            array_spec = (
+                ",".join(str(batch_id) for batch_id in batch_ids)
+                if batch_ids is not None else f"0-{array_limit}"
+            )
             run_rf3_code = '''import argparse
 from rf3.inference_engines.rf3 import RF3InferenceEngine
 
@@ -6134,7 +6259,7 @@ RF3InferenceEngine(ckpt_path="rf3", verbose=False).run(
 #SBATCH --time=24:00:00
 #SBATCH --partition=normal
 #SBATCH --gres=gpu:1
-#SBATCH --array=0-{array_limit}%8
+#SBATCH --array={array_spec}%8
 #SBATCH --export=NONE
 
 set -eo pipefail
@@ -6152,7 +6277,11 @@ python scripts/run_rf3.py --input_dir $CURRENT_INPUT_DIR --out_dir $CURRENT_OUTP
             ) as f:
                 f.write(slurm_rf3_code)
 
-        def _write_validation_scripts(self, base_dir, array_limit):
+        def _write_validation_scripts(self, base_dir, array_limit, batch_ids=None):
+            array_spec = (
+                ",".join(str(batch_id) for batch_id in batch_ids)
+                if batch_ids is not None else f"0-{array_limit}"
+            )
             run_val_code = '''import argparse, os, csv, json, re
 import numpy as np
 import biotite.structure.io.pdbx as pdbx
@@ -6279,7 +6408,7 @@ if results:
         w.writerows(results)
 '''
             with open(os.path.join(base_dir, "scripts", "run_validation.py"), "w") as f: f.write(run_val_code)
-            slurm_val_code = f'''#!/bin/bash\n#SBATCH --job-name=validate\n#SBATCH --output=logs/%x_%A_%a.out\n#SBATCH --error=logs/%x_%A_%a.err\n#SBATCH --ntasks=1\n#SBATCH --cpus-per-task=4\n#SBATCH --mem=8G\n#SBATCH --time=04:00:00\n#SBATCH --partition=cpu\n#SBATCH --array=0-{array_limit}\n#SBATCH --export=NONE\n\nset -eo pipefail\n\neval "$(conda shell.bash hook)"\nconda activate rfdxcop\n\nmkdir -p ./scores\npython scripts/run_validation.py --rf3_dir ./rf3_outputs/batch_${{SLURM_ARRAY_TASK_ID}} --rfd3_base_dir ./rfd3_outputs --output_csv ./scores/scores_batch_${{SLURM_ARRAY_TASK_ID}}.csv\n'''
+            slurm_val_code = f'''#!/bin/bash\n#SBATCH --job-name=validate\n#SBATCH --output=logs/%x_%A_%a.out\n#SBATCH --error=logs/%x_%A_%a.err\n#SBATCH --ntasks=1\n#SBATCH --cpus-per-task=4\n#SBATCH --mem=8G\n#SBATCH --time=04:00:00\n#SBATCH --partition=cpu\n#SBATCH --array={array_spec}\n#SBATCH --export=NONE\n\nset -eo pipefail\n\neval "$(conda shell.bash hook)"\nconda activate rfdxcop\n\nmkdir -p ./scores\npython scripts/run_validation.py --rf3_dir ./rf3_outputs/batch_${{SLURM_ARRAY_TASK_ID}} --rfd3_base_dir ./rfd3_outputs --output_csv ./scores/scores_batch_${{SLURM_ARRAY_TASK_ID}}.csv\n'''
             with open(os.path.join(base_dir, "scripts", "submit_validation_cpu.sh"), "w") as f: f.write(slurm_val_code)
 
         def _write_consolidation_script(
