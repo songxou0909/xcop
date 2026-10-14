@@ -14,31 +14,52 @@
     },
     {
       "path": "xcop_savings/2d_class_planner.py",
+      "preserve": [
+        "shebang"
+      ],
       "sha256": "450034021bd8a8580e224ce1cd5b17a478014e997ff2d4eee9d6830ca65c2f03"
     },
     {
       "path": "xcop_savings/atom2svg.py",
+      "preserve": [
+        "shebang"
+      ],
       "sha256": "aadbb27c2cd0f62c0079fe825f668c270c415e8ae7f45c630468775d55feacc6"
     },
     {
       "path": "xcop_savings/autofsc.py",
+      "preserve": [
+        "shebang"
+      ],
       "sha256": "c976d6701e9efc3532f0535cabfd18bc29d5fd80623292092d34aa79e77d2162"
     },
     {
       "path": "xcop_savings/AutoJPG/AutoJPG.py",
+      "preserve": [
+        "shebang"
+      ],
       "sha256": "85d6de1cc73cede451c6d1110fffc00958ffcd4e262c3d4a7b5eb45f5fe056c6"
     },
     {
       "path": "xcop_savings/foldx.py",
+      "preserve": [
+        "shebang"
+      ],
       "sha256": "5e73ff99ced457891054d305cd393775778ecd234fc685c492d2a068964c1c8a"
     },
     {
       "path": "xcop_savings/localres.py",
+      "preserve": [
+        "shebang"
+      ],
       "sha256": "dacd7854e64fb3def1fada48b35349845de0394c0f5dc377f215b4c46d35abc5"
     },
     {
       "path": "xcop_savings/modifier.py",
-      "sha256": "17c469bc459ac079ec78da3fa5dce7f1cadc7d8211972b54f5e91ce0fd11cfcd"
+      "preserve": [
+        "shebang"
+      ],
+      "sha256": "32b8c56513e4921d05af6a364d8b125c9e38c5906c7c6151542c656083066f9a"
     },
     {
       "path": "xcop_savings/queue_monitor.py",
@@ -50,27 +71,45 @@
     },
     {
       "path": "xcop_savings/quick_map.py",
+      "preserve": [
+        "shebang"
+      ],
       "sha256": "52ee828b3b1acef726af379dab0e8a9be64935aa4ae2d3b43a4d6433ea617af8"
     },
     {
       "path": "xcop_savings/scheduler.py",
+      "preserve": [
+        "shebang"
+      ],
       "sha256": "75655bb93d29a3c1ae32b4e549fcfc6cf1a490b17e82a3cf17b8919e179050b4"
     },
     {
       "path": "xcop_savings/validation.py",
+      "preserve": [
+        "shebang"
+      ],
       "sha256": "c53d9ec279671b58606adec6a198a428feccebecaa06b1622f8c761f70f030b7"
     },
     {
       "path": "xcop_savings/workflow.py",
+      "preserve": [
+        "shebang"
+      ],
       "sha256": "84d82d2edc587545d41c3d7056a7d5d6b4fc8bb27872ea1f77af49aceae64fca"
     },
     {
       "path": "xcop_savings/xrfd.py",
-      "sha256": "0e6a462393e81d2e081bd88a03dc95eed6387a3420befd3b81c63c89c199c5f9"
+      "preserve": [
+        "shebang"
+      ],
+      "sha256": "334afc6ce4429c30b2ab382cb50d27171aed070a07404d64c4dd53d9581a8e01"
     },
     {
       "path": "xcop_setup.py",
-      "sha256": "d16a317b7a51996afd7c7d46668184085e9f3a6d3e59391ffc3ea6f325957930"
+      "preserve": [
+        "shebang"
+      ],
+      "sha256": "3c37171497b12c44a09991a76c0bd6ca78964ccea4d1e6ccabd03ac2e5c9b2d1"
     }
   ]
 }
