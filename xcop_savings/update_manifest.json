@@ -102,7 +102,7 @@
       "preserve": [
         "shebang"
       ],
-      "sha256": "b42b74d05b4c72712b4e95f7f0d035088823cc4b30f52234457764a2ac35d405"
+      "sha256": "169dcdd1106e03cb202bada01a7feebb73616ee7434f7a16e4ff4bd0f4737cdf"
     },
     {
       "path": "xcop_setup.py",

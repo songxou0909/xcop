@@ -11,10 +11,11 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QLineEdit,
                              QSplitter, QSpinBox, QGroupBox, QFormLayout, 
                              QCheckBox, QTableWidget, QHeaderView, QTableWidgetItem, 
                              QTextBrowser, QDialog, QTabWidget, QComboBox,
-                             QTableView, QAbstractItemView)
+                             QTableView, QAbstractItemView, QScrollArea,
+                             QDoubleSpinBox, QColorDialog)
 from PyQt6.QtCore import (Qt, QTimer, QSize, QAbstractTableModel,
-                          QModelIndex, QProcess, QPointF)
-from PyQt6.QtGui import QColor
+                          QModelIndex, QProcess, QPointF, pyqtSignal)
+from PyQt6.QtGui import QColor, QImage, QPixmap
 
 # Pyqtgraph caches OpenGL shader program IDs at class level. Top-level
 # QOpenGLWidgets must share resources or a shader compiled by the main preview
@@ -252,6 +253,563 @@ class ScoreTableModel(QAbstractTableModel):
             self._header_key(header): self.rows[source_row][column]
             for column, header in enumerate(self.headers)
         }
+
+
+def visualization_defaults(criteria=None):
+    """JSON-safe, per-workspace plot settings; sizes are in points/inches."""
+    settings = {
+        "rmsd": 5.0, "binder_ptm": 0.7, "pae_min": 5.0,
+        "follow_extraction": True, "include_seeds": True,
+        "others_size": 8.0, "others_color": "#bfbfbf",
+        "others_edge": "#808080", "others_stroke": 0.3,
+        "others_alpha": 0.5, "others_depthshade": True,
+        "rasterize_others": True,
+        "hits_size": 35.0, "hits_color": "#98c379",
+        "hits_edge": "#c8ccff", "hits_stroke": 0.5,
+        "hits_alpha": 0.95, "hits_depthshade": False,
+        "others_label": "Others", "hits_label": "Hits",
+        "show_legend": True, "legend_title": "", "legend_size": 10.0,
+        "legend_color": "#222222", "legend_background": "#ffffff",
+        "legend_alpha": 0.9, "legend_location": "upper left",
+        "title": "", "title_size": 14.0,
+        "x_label": "r.m.s.d.", "y_label": "binder pTM",
+        "z_label": "minimum pAE", "label_size": 11.0,
+        "label_pad": 10.0, "tick_size": 9.0, "text_color": "#222222",
+        "background": "#ffffff", "grid": True,
+        "grid_color": "#e0e0e0", "grid_width": 0.5,
+        "elevation": 20.0, "azimuth": 140.0, "projection": "persp",
+        "x_min": "", "x_max": "", "y_min": "", "y_max": "",
+        "z_min": "", "z_max": "",
+        "width": 8.0, "height": 7.0, "dpi": 600,
+    }
+    if criteria:
+        settings.update({key: float(criteria[key]) for key in ScoreTableModel.CRITERIA})
+    return settings
+
+
+def find_visualization_sources(workspace):
+    """Prefer readable master scores, but never hide newer validation batches."""
+    if not workspace or not os.path.isdir(workspace):
+        return []
+    scores = os.path.join(workspace, "scores")
+    readable = os.path.join(scores, "MASTER_SCORES_READABLE.txt")
+    master = os.path.join(scores, "MASTER_SCORES_CLEAN.csv")
+    batches = sorted(
+        os.path.join(scores, name) for name in os.listdir(scores)
+        if name.lower().startswith("scores_batch_") and name.lower().endswith(".csv")
+    ) if os.path.isdir(scores) else []
+    latest_batch = max((os.stat(path).st_mtime_ns for path in batches), default=0)
+    if os.path.isfile(readable) and os.stat(readable).st_mtime_ns >= latest_batch:
+        return [readable]
+    if batches:
+        return batches
+    if os.path.isfile(master):
+        return [master]
+    # Also accept a folder containing a standalone readable table, as supplied
+    # with the original plotting script. Never search outside this workspace.
+    standalone = os.path.join(workspace, "MASTER_SCORES_READABLE.txt")
+    return [standalone] if os.path.isfile(standalone) else []
+
+
+def read_visualization_points(paths):
+    """Read named columns without pandas; reject nonfinite/missing coordinates."""
+    points, skipped = [], 0
+    for path in paths:
+        with open(path, "r", encoding="utf-8-sig", newline="", errors="replace") as handle:
+            if str(path).lower().endswith(".csv"):
+                reader = csv.reader(handle)
+            else:
+                reader = (line.split() for line in handle if line.strip())
+            headers = [ScoreTableModel._header_key(value) for value in next(reader, [])]
+            missing = set(ScoreTableModel.CRITERIA) - set(headers)
+            if missing:
+                raise ValueError(f"{os.path.basename(path)} is missing columns: {', '.join(sorted(missing))}")
+            for values in reader:
+                if not values:
+                    continue
+                row = dict(zip(headers, values))
+                coordinates = tuple(ScoreTableModel._number(row.get(key)) for key in ScoreTableModel.CRITERIA)
+                if any(value is None for value in coordinates):
+                    skipped += 1
+                    continue
+                sample = str(row.get("sample_type", "")).lower()
+                is_seed = ScoreTableModel._is_seed_design(row.get("design_name", "")) or sample.startswith("seed-")
+                points.append((*coordinates, is_seed))
+    return points, skipped
+
+
+def build_visualization_figure(points, settings):
+    """One fixed physical layout for the preview and all three export formats."""
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    visible = [row for row in points if settings["include_seeds"] or not row[3]]
+    hits, others = [], []
+    for row in visible:
+        passed = row[0] <= settings["rmsd"] and row[1] >= settings["binder_ptm"] and row[2] <= settings["pae_min"]
+        (hits if passed else others).append(row)
+
+    figure = Figure(figsize=(settings["width"], settings["height"]), dpi=110,
+                    facecolor=settings["background"])
+    FigureCanvasAgg(figure)
+    ax = figure.add_subplot(111, projection="3d", computed_zorder=False)
+    ax.set_facecolor(settings["background"])
+    for name, rows, zorder in (("others", others, 2), ("hits", hits, 3)):
+        coordinates = list(zip(*(row[:3] for row in rows))) if rows else ([], [], [])
+        ax.scatter(*coordinates, s=settings[f"{name}_size"],
+                   color=settings[f"{name}_color"], edgecolors=settings[f"{name}_edge"],
+                   linewidths=settings[f"{name}_stroke"], alpha=settings[f"{name}_alpha"],
+                   label=settings[f"{name}_label"], depthshade=settings[f"{name}_depthshade"],
+                   rasterized=name == "others" and settings["rasterize_others"], zorder=zorder)
+    for key, axis in (("x", ax.xaxis), ("y", ax.yaxis), ("z", ax.zaxis)):
+        getattr(ax, f"set_{key}label")(settings[f"{key}_label"], fontsize=settings["label_size"],
+                                     labelpad=settings["label_pad"], color=settings["text_color"])
+        limits = []
+        for suffix in ("min", "max"):
+            raw = settings[f"{key}_{suffix}"].strip()
+            value = ScoreTableModel._number(raw) if raw else None
+            if raw and value is None:
+                raise ValueError(f"{key.upper()} {suffix} must be a finite number or blank (automatic).")
+            limits.append(value)
+        automatic = getattr(ax, f"get_{key}lim")()
+        low, high = (automatic[i] if value is None else value for i, value in enumerate(limits))
+        if low >= high:
+            raise ValueError(f"{key.upper()} axis minimum must be less than its maximum.")
+        getattr(ax, f"set_{key}lim")(low, high)
+        axis.pane.set_facecolor(settings["background"])
+        axis.pane.set_edgecolor(settings["grid_color"])
+        axis.line.set_color(settings["text_color"])
+        # mplot3d does not implement grid styling through Axes.grid kwargs.
+        axis._axinfo["grid"].update(color=settings["grid_color"], linewidth=settings["grid_width"])
+    ax.tick_params(labelsize=settings["tick_size"], colors=settings["text_color"])
+    ax.grid(settings["grid"])
+    ax.view_init(elev=settings["elevation"], azim=settings["azimuth"])
+    ax.set_proj_type(settings["projection"])
+    if settings["title"]:
+        figure.suptitle(settings["title"], fontsize=settings["title_size"],
+                        color=settings["text_color"], y=0.95)
+    if settings["show_legend"]:
+        legend = ax.legend(loc=settings["legend_location"], fontsize=settings["legend_size"],
+                           labelcolor=settings["legend_color"], title=settings["legend_title"],
+                           title_fontsize=settings["legend_size"], facecolor=settings["legend_background"],
+                           framealpha=settings["legend_alpha"])
+        legend.get_title().set_color(settings["legend_color"])
+    # Explicit margins keep the PDF page, SVG viewBox and PNG dimensions equal.
+    figure.subplots_adjust(left=0.08, right=0.86, bottom=0.10, top=0.88)
+    return figure, len(hits), len(others)
+
+
+class VisualizationPreview(QLabel):
+    """Fit a rendered page without changing its physical layout or aspect ratio."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.page = None
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setWordWrap(True)
+        self.setMinimumSize(240, 260)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.setStyleSheet("background: #303238; color: #dddddd; padding: 8px;")
+
+    def show_message(self, message):
+        self.page = None
+        self.clear()
+        self.setText(message)
+
+    def set_page(self, pixmap):
+        self.page = pixmap
+        self.fit_page()
+
+    def fit_page(self):
+        if self.page is not None:
+            self.setPixmap(self.page.scaled(self.contentsRect().size() - QSize(16, 16),
+                                           Qt.AspectRatioMode.KeepAspectRatio,
+                                           Qt.TransformationMode.SmoothTransformation))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.fit_page()
+
+
+class VisualizationTab(QWidget):
+    settingsChanged = pyqtSignal()
+
+    def __init__(self, criteria_provider, parent=None):
+        super().__init__(parent)
+        self.criteria_provider = criteria_provider
+        self.workspace = ""
+        self.controls = {}
+        self.color_keys = set()
+        self._updating = False
+        self.signature = None
+        self.points = []
+        self.skipped = 0
+        self.source_description = ""
+        self.figure = None
+        self._dirty = True
+        self.render_timer = QTimer(self)
+        self.render_timer.setSingleShot(True)
+        self.render_timer.setInterval(250)
+        self.render_timer.timeout.connect(self.render_preview)
+        self._build_ui()
+        self.restore_settings({})
+        self.clear_plot("Select a workspace to preview its scores.")
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
+        header = QHBoxLayout()
+        header.addWidget(self.status, 1)
+        reload_button = QPushButton("Reload data")
+        reload_button.clicked.connect(lambda: self.refresh(force=True))
+        header.addWidget(reload_button)
+        layout.addLayout(header)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        self.preview = VisualizationPreview()
+        split.addWidget(self.preview)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumWidth(280)
+        panel = QWidget()
+        groups = QVBoxLayout(panel)
+        groups.setContentsMargins(6, 0, 6, 6)
+        defaults = visualization_defaults()
+
+        def group(title):
+            box = QGroupBox(title)
+            groups.addWidget(box)
+            form = QFormLayout(box)
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            return form
+
+        def field(form, key, label, limits=None, choices=None):
+            default = defaults[key]
+            if isinstance(default, bool):
+                widget = QCheckBox()
+                signal = widget.toggled
+            elif choices:
+                widget = QComboBox()
+                widget.addItems(choices)
+                signal = widget.currentTextChanged
+            elif limits:
+                widget = QSpinBox() if isinstance(default, int) else QDoubleSpinBox()
+                widget.setRange(limits[0], limits[1])
+                widget.setSingleStep(limits[2])
+                if isinstance(widget, QDoubleSpinBox):
+                    widget.setDecimals(3 if key in ScoreTableModel.CRITERIA else 2)
+                widget.setKeyboardTracking(False)
+                signal = widget.valueChanged
+            elif isinstance(default, str) and default.startswith("#"):
+                widget = QPushButton()
+                self.color_keys.add(key)
+                widget.clicked.connect(lambda _checked=False, k=key: self.choose_color(k))
+                signal = None
+            else:
+                widget = QLineEdit()
+                widget.setMaxLength(250)
+                if key.endswith(("_min", "_max")):
+                    widget.setPlaceholderText("Auto")
+                signal = widget.textChanged
+            widget.setObjectName("visualization_" + key)
+            self.controls[key] = widget
+            form.addRow(label, widget)
+            if signal is not None:
+                signal.connect(lambda _value, k=key: self.control_changed(k))
+
+        form = group("Hit thresholds")
+        field(form, "follow_extraction", "Follow local extraction")
+        self.controls["follow_extraction"].setToolTip(
+            "Start with Quality Filtering cutoffs. Editing a plot cutoff turns off following; "
+            "it never changes extraction settings. Cutoffs are inclusive (≤ / ≥).")
+        field(form, "rmsd", "Max RMSD (≤)", (0, 50, 0.1))
+        field(form, "binder_ptm", "Min binder pTM (≥)", (0, 1, 0.01))
+        field(form, "pae_min", "Max PAE Min (≤)", (0, 50, 0.1))
+        field(form, "include_seeds", "Include seed/sample rows")
+        for prefix, title in (("others", "Other dots"), ("hits", "Hit dots")):
+            form = group(title)
+            field(form, prefix + "_size", "Size (pt²)", (0.1, 500, 1))
+            field(form, prefix + "_color", "Fill color")
+            field(form, prefix + "_stroke", "Stroke width (pt)", (0, 10, 0.1))
+            field(form, prefix + "_edge", "Stroke color")
+            field(form, prefix + "_alpha", "Opacity", (0, 1, 0.05))
+            field(form, prefix + "_depthshade", "Depth shading")
+        form = group("Legend")
+        field(form, "show_legend", "Show legend")
+        field(form, "others_label", "Other dots text")
+        field(form, "hits_label", "Hit dots text")
+        field(form, "legend_title", "Legend title")
+        field(form, "legend_size", "Text size (pt)", (4, 36, 1))
+        field(form, "legend_color", "Text color")
+        field(form, "legend_background", "Background color")
+        field(form, "legend_alpha", "Background opacity", (0, 1, 0.05))
+        field(form, "legend_location", "Position", choices=[
+            "upper left", "upper right", "lower left", "lower right", "center left",
+            "center right", "upper center", "lower center", "center"])
+        form = group("Labels and axes")
+        for key, label in (("title", "Plot title"), ("x_label", "X label"),
+                           ("y_label", "Y label"), ("z_label", "Z label")):
+            field(form, key, label)
+        field(form, "title_size", "Title size (pt)", (4, 40, 1))
+        field(form, "label_size", "Axis label size (pt)", (4, 36, 1))
+        field(form, "label_pad", "Axis label spacing (pt)", (0, 40, 1))
+        field(form, "tick_size", "Tick size (pt)", (4, 28, 1))
+        field(form, "text_color", "Axis / title color")
+        for axis in "xyz":
+            field(form, axis + "_min", axis.upper() + " minimum")
+            field(form, axis + "_max", axis.upper() + " maximum")
+        form = group("View and page")
+        field(form, "elevation", "Elevation (°)", (-90, 90, 5))
+        field(form, "azimuth", "Azimuth (°)", (-180, 180, 5))
+        field(form, "projection", "Projection", choices=["persp", "ortho"])
+        field(form, "background", "Page color")
+        field(form, "grid", "Show grid")
+        field(form, "grid_color", "Grid color")
+        field(form, "grid_width", "Grid width (pt)", (0, 5, 0.1))
+        field(form, "width", "Page width (in)", (4, 16, 0.5))
+        field(form, "height", "Page height (in)", (4, 16, 0.5))
+        form = group("Export quality")
+        field(form, "dpi", "PNG / raster DPI", (150, 1200, 50))
+        field(form, "rasterize_others", "Rasterize other dots")
+        self.controls["rasterize_others"].setToolTip(
+            "Smaller PDF/SVG files with high-resolution background dots. "
+            "Uncheck for fully vector dots. Hit dots and axes remain vector.")
+        self.resolution_label = QLabel()
+        self.resolution_label.setWordWrap(True)
+        form.addRow(self.resolution_label)
+        reset = QPushButton("Reset visualization settings")
+        reset.clicked.connect(self.reset_settings)
+        groups.addWidget(reset)
+        groups.addStretch()
+        scroll.setWidget(panel)
+        split.addWidget(scroll)
+        split.setSizes([650, 300])
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 0)
+        layout.addWidget(split, 1)
+        footer = QHBoxLayout()
+        note = QLabel("Page preview • change the view with elevation / azimuth")
+        note.setWordWrap(True)
+        footer.addWidget(note, 1)
+        self.export_buttons = []
+        for extension in ("pdf", "png", "svg"):
+            button = QPushButton("Export " + extension.upper())
+            button.clicked.connect(lambda _checked=False, ext=extension: self.export_dialog(ext))
+            footer.addWidget(button)
+            self.export_buttons.append(button)
+        layout.addLayout(footer)
+
+    def settings(self):
+        result = {}
+        for key, widget in self.controls.items():
+            if key in self.color_keys:
+                value = widget.text()
+            elif isinstance(widget, QCheckBox):
+                value = widget.isChecked()
+            elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+                value = widget.value()
+            elif isinstance(widget, QComboBox):
+                value = widget.currentText()
+            else:
+                value = widget.text()
+            result[key] = value
+        return result
+
+    def _set_control(self, key, value):
+        widget = self.controls[key]
+        if key in self.color_keys:
+            color = QColor(str(value))
+            if not color.isValid():
+                return
+            widget.setText(color.name())
+            contrast = "#111111" if color.lightnessF() > 0.55 else "#ffffff"
+            widget.setStyleSheet(f"background-color: {color.name()}; color: {contrast}; padding: 4px;")
+        elif isinstance(widget, QCheckBox):
+            if isinstance(value, bool):
+                widget.setChecked(value)
+        elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+            number = ScoreTableModel._number(value)
+            if number is not None:
+                widget.setValue(int(number) if isinstance(widget, QSpinBox) else number)
+        elif isinstance(widget, QComboBox):
+            if widget.findText(str(value)) >= 0:
+                widget.setCurrentText(str(value))
+        else:
+            widget.setText(str(value))
+
+    def restore_settings(self, saved):
+        self.render_timer.stop()
+        self._dirty = True
+        self._updating = True
+        try:
+            for key, value in visualization_defaults(self.criteria_provider()).items():
+                self._set_control(key, value)
+            if isinstance(saved, dict):
+                for key, value in saved.items():
+                    if key in self.controls:
+                        self._set_control(key, value)
+            if self.controls["follow_extraction"].isChecked():
+                for key, value in self.criteria_provider().items():
+                    self._set_control(key, value)
+        finally:
+            self._updating = False
+        self.update_resolution()
+        if self.isVisible():
+            self.render_timer.start()
+
+    def reset_settings(self):
+        self.restore_settings({})
+        self.settingsChanged.emit()
+
+    def choose_color(self, key):
+        color = QColorDialog.getColor(QColor(self.controls[key].text()), self, "Choose color")
+        if color.isValid():
+            self._set_control(key, color.name())
+            self.control_changed(key)
+
+    def control_changed(self, key):
+        if self._updating:
+            return
+        self._dirty = True
+        self._updating = True
+        try:
+            if key in ScoreTableModel.CRITERIA:
+                self.controls["follow_extraction"].setChecked(False)
+            elif key == "follow_extraction" and self.controls[key].isChecked():
+                for name, value in self.criteria_provider().items():
+                    self._set_control(name, value)
+        finally:
+            self._updating = False
+        self.update_resolution()
+        self.settingsChanged.emit()
+        if self.isVisible():
+            self.render_timer.start()
+
+    def extraction_criteria_changed(self, *_args):
+        if self.controls["follow_extraction"].isChecked():
+            self.control_changed("follow_extraction")
+
+    def update_resolution(self):
+        settings = self.settings()
+        width = round(settings["width"] * settings["dpi"])
+        height = round(settings["height"] * settings["dpi"])
+        self.resolution_label.setText(f"PNG: {width:,} × {height:,} px. PDF/SVG retain vector text and hit dots.")
+
+    def clear_plot(self, message):
+        self.figure = None
+        self.preview.show_message(message)
+        self.status.setText(message)
+        for button in self.export_buttons:
+            button.setEnabled(False)
+
+    def set_workspace(self, workspace):
+        self.workspace = workspace
+        self.signature = None
+        self.points = []
+        self.skipped = 0
+        self.source_description = ""
+        self.restore_settings({})
+        self.clear_plot("Open Visualization to load this workspace's scores.")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh()
+
+    def refresh(self, force=False):
+        self.render_timer.stop()
+        try:
+            paths = find_visualization_sources(self.workspace)
+            signature = tuple((path, os.stat(path).st_mtime_ns, os.path.getsize(path)) for path in paths)
+            if not paths:
+                self.signature = None
+                self.points = []
+                self.clear_plot("No scores found. Run CPU validation / Output Passed Designs, then reload.\n"
+                                "Expected: scores/MASTER_SCORES_READABLE.txt or scores/scores_batch_*.csv")
+                return
+            changed = force or signature != self.signature
+            if changed:
+                self.points, self.skipped = read_visualization_points(paths)
+                self.signature = signature
+                self.source_description = (os.path.relpath(paths[0], self.workspace) if len(paths) == 1
+                                           else f"{len(paths)} current batch CSV files")
+                self.status.setToolTip("\n".join(paths))
+            if changed or self.figure is None or self._dirty:
+                self.render_preview()
+        except (OSError, ValueError, csv.Error) as error:
+            self.signature = None
+            self.points = []
+            self.clear_plot(f"Unable to read visualization scores: {error}")
+
+    def render_preview(self):
+        self.render_timer.stop()
+        if not self.points:
+            if self.signature:
+                self.clear_plot(f"No valid numeric score rows in {self.source_description}. Skipped: {self.skipped:,}.")
+            return
+        try:
+            figure, hits, others = build_visualization_figure(self.points, self.settings())
+            figure.canvas.draw()
+            width, height = figure.canvas.get_width_height()
+            rgba = figure.canvas.buffer_rgba()
+            page = QImage(rgba, width, height, width * 4, QImage.Format.Format_RGBA8888).copy()
+            self.figure = figure
+            self._dirty = False
+            self.preview.set_page(QPixmap.fromImage(page))
+            self.status.setText(f"{self.source_description} • {hits + others:,} plotted rows • "
+                                f"{hits:,} hits • {others:,} others • {self.skipped:,} invalid rows skipped\n"
+                                "Hits satisfy all three inclusive cutoffs; rows are not sequence-deduplicated.")
+            for button in self.export_buttons:
+                button.setEnabled(True)
+        except ImportError:
+            self.clear_plot("Visualization requires Matplotlib. Install it in the xrfd environment: python -m pip install matplotlib")
+        except Exception as error:
+            self.clear_plot(f"Cannot render visualization: {error}")
+
+    def export_file(self, path, extension):
+        """Export from the same settings/layout as the preview, never its bitmap."""
+        if extension not in {"pdf", "png", "svg"}:
+            raise ValueError("Choose PDF, PNG or SVG.")
+        self.refresh()
+        if self.figure is None:
+            raise ValueError(self.status.text())
+        settings = self.settings()
+        pixels = settings["width"] * settings["height"] * settings["dpi"] ** 2
+        if pixels > 100_000_000 and (extension == "png" or settings["rasterize_others"]):
+            raise ValueError("This raster would exceed 100 megapixels. Reduce page dimensions or DPI, "
+                             "or disable rasterized dots for PDF/SVG.")
+        from matplotlib import rc_context
+        # Explicit rc values prevent a user's savefig.bbox/transparent defaults
+        # from cropping the page or changing its background relative to preview.
+        with rc_context({"savefig.bbox": None, "svg.fonttype": "none", "pdf.fonttype": 42}):
+            self.figure.savefig(path, format=extension, dpi=settings["dpi"],
+                                facecolor=settings["background"], transparent=False)
+
+    def export_dialog(self, extension):
+        path, _selected = QFileDialog.getSaveFileName(
+            self, "Export visualization", os.path.join(self.workspace, "3d_scatter." + extension),
+            f"{extension.upper()} (*.{extension})")
+        if not path:
+            return
+        if not path.lower().endswith("." + extension):
+            path += "." + extension
+            if os.path.exists(path) and QMessageBox.question(
+                self, "Replace file?", f"Replace {path}?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
+                return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        error = None
+        try:
+            self.export_file(path, extension)
+        except Exception as exc:
+            error = str(exc)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if error:
+            QMessageBox.critical(self, "Visualization export failed", error)
+        else:
+            QMessageBox.information(self, "Visualization exported", f"Saved {extension.upper()} to:\n{path}")
 
 
 def merge_structure_chains_with_biopython(input_path, output_path):
@@ -3936,6 +4494,9 @@ rc("close session")
             scores_layout.addWidget(self.score_table, 1)
             self.right_tabs.addTab(scores_tab, "Scores")
 
+            self.visualization = VisualizationTab(self.get_extraction_criteria, self)
+            self.right_tabs.addTab(self.visualization, "Visualization")
+
             right_layout.addWidget(self.right_tabs, 1)
             
             splitter.addWidget(left_scroll)
@@ -3947,6 +4508,7 @@ rc("close session")
             main_layout.addWidget(splitter)
 
         def connect_project_state_signals(self):
+            self.visualization.settingsChanged.connect(self.schedule_project_state_save)
             for line_edit in (
                 self.input_pdb_input,
                 self.binder_length_input,
@@ -3988,6 +4550,20 @@ rc("close session")
                 widget.valueChanged.connect(
                     lambda _value: self.criteria_refresh_timer.start()
                 )
+                widget.valueChanged.connect(self.visualization.extraction_criteria_changed)
+
+        def get_extraction_criteria(self):
+            return {
+                "rmsd": self.rmsd_cutoff_spin.value(),
+                "binder_ptm": self.ptm_cutoff_spin.value(),
+                "pae_min": self.pae_cutoff_spin.value(),
+            }
+
+        def closeEvent(self, event):
+            self.state_save_timer.stop()
+            self.save_project_state()
+            self.visualization.render_timer.stop()
+            super().closeEvent(event)
 
         def get_project_state_path(self, pwd=None):
             pwd = pwd or self._current_project_dir
@@ -4439,12 +5015,15 @@ rc("close session")
                 self.slider_stroke.setValue(30)
                 self.mol_canvas.plot_structure([])
                 self.lbl_selection_count.setText("Selected atoms: 0")
+                self.visualization.set_workspace(pwd)
             finally:
                 self._restoring_project_state = False
 
             restored = self.restore_project_state(pwd)
             self.check_all_job_statuses(pwd)
             self.refresh_scores(force=True)
+            if self.visualization.isVisible():
+                self.visualization.refresh(force=True)
             if not restored:
                 self.save_project_state()
 
@@ -4453,6 +5032,8 @@ rc("close session")
             if pwd and os.path.isdir(pwd):
                 self.check_all_job_statuses(os.path.abspath(pwd))
                 self.refresh_scores(force=False)
+                if self.visualization.isVisible():
+                    self.visualization.refresh()
 
         def get_current_job_parameters(self):
             selected_atoms = []
@@ -4493,6 +5074,7 @@ rc("close session")
                 "atom_size": self.slider_size.value(),
                 "stroke_size": self.slider_stroke.value(),
                 "selected_atoms": selected_atoms,
+                "visualization": self.visualization.settings(),
             }
 
         def restore_job_parameters(self, parameters):
@@ -4546,6 +5128,8 @@ rc("close session")
             self.generated_json_path = str(
                 parameters.get("generated_json_path", "") or ""
             )
+
+            self.visualization.restore_settings(parameters.get("visualization", {}))
 
             pdb_path = str(parameters.get("input_pdb", "") or "")
             if pdb_path:
@@ -6081,6 +6665,7 @@ rc("close session")
                 QMessageBox.information(self, "Success", message)
                 if self._current_project_dir == pwd:
                     self.refresh_scores(force=True, activate=True)
+                    self.visualization.refresh(force=True)
             else:
                 details = output or "The extraction process exited unexpectedly."
                 QMessageBox.critical(
