@@ -88,7 +88,7 @@
       "preserve": [
         "shebang"
       ],
-      "sha256": "c53d9ec279671b58606adec6a198a428feccebecaa06b1622f8c761f70f030b7"
+      "sha256": "c3018d15dba7b1942d075ee9b3e90239af25f77d87edd2ad76707b51f6ed42dd"
     },
     {
       "path": "xcop_savings/workflow.py",

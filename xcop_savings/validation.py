@@ -6,12 +6,14 @@ import subprocess
 import gc
 import traceback
 import json
+import shlex
+from html import escape as escape_html
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QLabel, QLineEdit, QPushButton, QFileDialog, QGroupBox, 
     QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView, 
     QMessageBox, QAbstractItemView, QCheckBox, 
-    QDialog, QRadioButton, QDialogButtonBox, QFileIconProvider
+    QDialog, QRadioButton, QDialogButtonBox, QFileIconProvider, QFrame
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QFileInfo, QTimer, QLineF
 from PyQt6.QtGui import QColor, QPalette, QFont, QPainter, QPixmap, QIcon, QPen
@@ -166,9 +168,11 @@ logger = Logger()
 # ==============================================================================
 # 2. BACKEND
 # ==============================================================================
-def run_tool(tool_name, args, redirect_output_path=None):
+def run_tool(tool_name, args, redirect_output_path=None, check=False):
+    if isinstance(args, (list, tuple)):
+        args = " ".join(shlex.quote(str(arg)) for arg in args)
     cmd_str = f"{tool_name} {args}"
-    full_cmd = f"export OMP_NUM_THREADS=1 && module load {PHENIX_VER} && {cmd_str}"
+    full_cmd = f"export OMP_NUM_THREADS=1 && module load {shlex.quote(PHENIX_VER)} && {cmd_str}"
 
     logger.log(f"--- RUNNING: {tool_name} ---")
 
@@ -188,9 +192,23 @@ def run_tool(tool_name, args, redirect_output_path=None):
                 logger.log(f">>> STDOUT ({tool_name}):\n{stdout_str}")
 
         if stderr_str: logger.log(f">>> STDERR ({tool_name}):\n{stderr_str}")
+
+        if check and result.returncode != 0:
+            detail = (stderr_str or stdout_str).strip()[-2000:]
+            raise RuntimeError(f"{tool_name} failed (exit {result.returncode}).\n{detail}")
         
         # 2. Write file if requested
         if redirect_output_path:
+            # Some phenix.reduce dispatchers do not propagate Reduce's exit code.
+            # Never accept a help/error message or a stale PDB as prepared output.
+            if check:
+                if not any(line.startswith(("ATOM  ", "HETATM"))
+                           for line in stdout_str.splitlines()):
+                    detail = (stderr_str or stdout_str).strip()[-2000:]
+                    raise RuntimeError(f"{tool_name} produced no PDB atoms.\n{detail}")
+                with open(redirect_output_path, "w", encoding='utf-8') as f:
+                    f.write(stdout_str)
+                return ""
             if stdout_str and len(stdout_str) > 50:
                 try:
                     # FIX: Write with explicit encoding
@@ -204,6 +222,8 @@ def run_tool(tool_name, args, redirect_output_path=None):
 
     except Exception as e:
         logger.log(f"CRITICAL ERROR executing {tool_name}: {e}")
+        if check:
+            raise
         return ""
 
 def parse_val(regex, text, default=0.0):
@@ -211,6 +231,49 @@ def parse_val(regex, text, default=0.0):
     match = re.search(regex, text)
     if match: return float(match.group(1))
     return default
+
+def chart_category_tooltips(residues):
+    """Summarize recorded chart classifications, without re-scoring residues."""
+    rows = list(residues.values())
+    definitions = {
+        4: ("Rama", "Ramachandran", (
+            ("Favored", "FAVORED"), ("Allowed", "ALLOWED"), ("Outlier", "OUTLIER"))),
+        5: ("Rotamer", "Rotamer", (
+            ("Favored", "FAVORED"), ("Allowed", "ALLOWED"), ("Outlier", "OUTLIER"))),
+        7: ("CaBLAM", "CaBLAM", (
+            ("Favored", "CABLAM FAVORED"), ("Disfavored", "CABLAM DISFAVORED"),
+            ("CaBLAM outlier", "CABLAM OUTLIER"),
+            ("CA geometry outlier", "CA GEOM OUTLIER"))),
+    }
+    tooltips = {}
+    for column, (field, title, categories) in definitions.items():
+        counts = {label: 0 for label, _ in categories}
+        for row in rows:
+            # The percentage in a cell is a Phenix probability, not the
+            # percentage of residues belonging to that category.
+            status = str(row.get(field) or "").split("(", 1)[0].strip().upper()
+            for label, classification in categories:
+                if status == classification:
+                    counts[label] += 1
+                    break
+        classified = sum(counts.values())
+        lines = [f"{title} — summary of displayed residue rows"]
+        if classified:
+            lines.append(f"Percentages among {classified:,} classified rows:")
+            lines.extend(f"{label}: {count / classified * 100:.2f}% ({count:,}/{classified:,})"
+                         for label, count in counts.items())
+        else:
+            lines.append("No classified results available.")
+        if rows:
+            lines.append(f"Not reported / unclassified: {len(rows) - classified:,} "
+                         f"of {len(rows):,} rows (excluded from percentages).")
+            lines.append("One entry per displayed row; alternate conformations are not counted separately.")
+        else:
+            lines.append("Run an analysis or load a saved result to see percentages.")
+        if field == "CaBLAM" and counts["CA geometry outlier"]:
+            lines.append("CA geometry outliers are shown separately because they replace the CaBLAM label in this chart.")
+        tooltips[column] = "\n".join(lines)
+    return tooltips
 
 class AnalysisBackend:
     def __init__(self):
@@ -259,7 +322,41 @@ class AnalysisBackend:
             }
         return self.residue_data[key]
 
-    def run_full_analysis(self, input_pdb, status_callback, do_renumber=True, do_cleanup=False):
+    def prepare_model(self, input_pdb, status_callback, allow_flips=False,
+                      keep_hydrogens=False, nuclear=False):
+        """Delegate all H placement and N/Q/H optimization to Phenix Reduce.
+
+        Official options: https://github.com/rlabduke/reduce/blob/master/reduce_src/main.cpp
+        Clash handling: https://github.com/cctbx/cctbx_project/blob/master/mmtbx/programs/clashscore.py
+        """
+        if allow_flips and keep_hydrogens:
+            raise ValueError("Allow flips requires regenerating hydrogens. "
+                             "Uncheck Keep existing hydrogens first.")
+        abs_input = os.path.abspath(input_pdb)
+        if keep_hydrogens:
+            status_callback("Keeping input H/D atoms and deposited side chains...")
+            return abs_input, []
+
+        base = os.path.splitext(abs_input)[0]
+        stripped_pdb = base + "_cleanH.pdb"
+        final_pdb = base + "_withH.pdb"
+        status_callback("Removing H/D atoms with Phenix Reduce...")
+        run_tool("phenix.reduce", ["-Trim", abs_input],
+                 redirect_output_path=stripped_pdb, check=True)
+        mode = "allowing Asn/Gln/His flips" if allow_flips else "no Asn/Gln/His flips"
+        distances = "nuclear" if nuclear else "electron-cloud"
+        status_callback(f"Adding hydrogens: {mode}, {distances} X-H distances...")
+        reduce_args = ["-FLIP" if allow_flips else "-NOFLIP"]
+        if nuclear:
+            reduce_args.append("-NUClear")
+        reduce_args.append(stripped_pdb)
+        run_tool("phenix.reduce", reduce_args,
+                 redirect_output_path=final_pdb, check=True)
+        return final_pdb, [stripped_pdb, final_pdb]
+
+    def run_full_analysis(self, input_pdb, status_callback, do_renumber=True,
+                          do_cleanup=False, allow_flips=False,
+                          keep_hydrogens=False, nuclear=False):
         logger.setup(input_pdb)
         self.residue_data = {}
         self.summary_data = {
@@ -268,33 +365,27 @@ class AnalysisBackend:
             'cb_out_cnt': 0, 'cis_pro_cnt': 0, 'cis_pro_total': 0,
             'twisted_cnt': 0, 'twisted_total': 0, 'cab_out_cnt': 0, 'cab_total': 0,
             'ca_geo_cnt': 0, 'ca_geo_total': 0, 'b_out_cnt': 0, 'b_total': 0, 
-            'a_out_cnt': 0, 'a_total': 0
+            'a_out_cnt': 0, 'a_total': 0,
+            'validation_options': {
+                'allow_flips': allow_flips,
+                'keep_hydrogens': keep_hydrogens,
+                'nuclear': nuclear,
+                'phenix_module': PHENIX_VER,
+            }
         }
         
         abs_input = os.path.abspath(input_pdb)
         work_dir = os.path.dirname(abs_input)
         base_name = os.path.splitext(os.path.basename(abs_input))[0]
         
-        stripped_pdb = os.path.join(work_dir, f"{base_name}_cleanH.pdb")
-        final_pdb = os.path.join(work_dir, f"{base_name}_withH.pdb")
-        generated_files = [stripped_pdb, final_pdb]
-        
+        final_pdb, generated_files = self.prepare_model(
+            abs_input, status_callback, allow_flips, keep_hydrogens, nuclear)
+
         self.db_file = os.path.join(work_dir, f"{base_name}_Molprobity.txt")
         with open(self.db_file, 'w', encoding='utf-8') as f: json.dump({}, f)
-
-        # 1. STRIP H
-        status_callback("Removing Hydrogens...")
-        run_tool("phenix.pdbtools", f"\"{abs_input}\" remove=\"element H\" output.file_name=\"{stripped_pdb}\"")
-        if not os.path.exists(stripped_pdb): stripped_pdb = abs_input
-
-        # 2. ADD H
-        status_callback("Adding Hydrogens...")
-        run_tool("phenix.reduce", f"\"{stripped_pdb}\" -NoFlip", redirect_output_path=final_pdb)
-        if not os.path.exists(final_pdb):
-             run_tool("phenix.reduce", f"\"{stripped_pdb}\" flip=False", redirect_output_path=final_pdb)
         
         # 2b. RENUMBER
-        if os.path.exists(final_pdb) and do_renumber:
+        if do_renumber and not keep_hydrogens:
             status_callback("Renumbering atoms...")
             renum_pdb = os.path.join(work_dir, f"{base_name}_renumH.pdb")
             try:
@@ -316,8 +407,7 @@ class AnalysisBackend:
             except Exception as e:
                 logger.log(f"WARNING: Renumbering failed: {e}")
 
-        if not os.path.exists(final_pdb): final = stripped_pdb
-        else: final = final_pdb
+        final = final_pdb
 
         # 3. READ RESIDUES
         self.load_db() # LOAD
@@ -348,8 +438,15 @@ class AnalysisBackend:
         # 4. CLASHSCORE
         self.load_db() # LOAD
         status_callback("Running Clashscore...")
-        out_clash = run_tool("phenix.clashscore", f"\"{final}\" keep_hydrogens=True verbose=True")
-        self.summary_data['clashscore'] = parse_val(r"clashscore\s*=\s*([\d\.]+)", out_clash)
+        # Flips have already been applied to the model used by ALL validators.
+        # keep_hydrogens preserves its coordinates; Phenix adds H/D if none exist.
+        out_clash = run_tool("phenix.clashscore", [final, "keep_hydrogens=True",
+                             f"nuclear={nuclear}", "verbose=True"], check=True)
+        clashscore = parse_val(r"clashscore\s*=\s*([\d\.]+)", out_clash, default=None)
+        if clashscore is None:
+            raise RuntimeError("Phenix returned no clashscore. Check its output and "
+                               "the selected Phenix module; no score was substituted.")
+        self.summary_data['clashscore'] = clashscore
         
         for line in out_clash.splitlines():
             if ":" in line and "Bad Clashes" not in line:
@@ -631,17 +728,23 @@ class AnalysisWorker(QObject):
     results_ready = pyqtSignal()
     status_update = pyqtSignal(str)
 
-    def __init__(self, backend, pdb_path, renumber, cleanup):
+    def __init__(self, backend, pdb_path, renumber, cleanup, allow_flips=False,
+                 keep_hydrogens=False, nuclear=False):
         super().__init__()
         self.backend = backend
         self.pdb_path = pdb_path
         self.renumber = renumber
         self.cleanup = cleanup
+        self.allow_flips = allow_flips
+        self.keep_hydrogens = keep_hydrogens
+        self.nuclear = nuclear
 
     def run(self):
         try:
             success, generated_files = self.backend.run_full_analysis(
-                self.pdb_path, self.emit_status, self.renumber
+                self.pdb_path, self.emit_status, self.renumber,
+                allow_flips=self.allow_flips,
+                keep_hydrogens=self.keep_hydrogens, nuclear=self.nuclear
             )
             
             if success:
@@ -850,10 +953,36 @@ class MolProbityGUI(QMainWindow):
         self.chk_renumber.setToolTip("***Renumber the hydrogen for the PDB generated by Phenix\n\nHydrogen added by Phenix will have only zeros for the atom serial numbers\nYou will get warnings if open in ChimeraX")
         self.chk_renumber.setChecked(False)
         self.chk_clean = QCheckBox("Remove Intermediate Files")
-        self.chk_clean.setToolTip("***This allows auto cleaning of these intermediate files:\n\nPDB_cleanH.pdb - Generated when removing hydrogens\nPDB_withH.pdb - Generated when adding hydrogens\n\nNote that Phenix adds hydrogen with Nuclear x-H, but when computing clashes, it will use the bond length of that in Electron-cloud x-H")
+        self.chk_clean.setToolTip(
+            "Remove the _cleanH.pdb and _withH.pdb files created by this run.\n"
+            "The input PDB and any requested _renumH.pdb are retained.")
         self.chk_clean.setChecked(True)
+        self.chk_flips = QCheckBox("Allow Asn/Gln/His flips")
+        self.chk_flips.setChecked(False)
+        self.chk_flips.setToolTip(
+            "Let Phenix Reduce optimize Asn/Gln/His orientations.\n"
+            "Unchecked: keep deposited side-chain orientations (the previous default).\n"
+            "Flips require regenerating hydrogens, so cannot be combined with Keep existing hydrogens.")
+        self.chk_keep_h = QCheckBox("Keep existing hydrogens (do not re-add)")
+        self.chk_keep_h.setChecked(False)
+        self.chk_keep_h.setToolTip(
+            "Use the input PDB directly, preserving existing H/D coordinates.\n"
+            "No stripping, Reduce optimization, or renumbering is performed.\n"
+            "If no H/D atoms exist, Phenix clashscore adds hydrogens internally.\n"
+            "A partial set of existing hydrogens is kept without filling missing atoms.")
+        self.chk_nuclear = QCheckBox("Use nuclear X-H distances (for neutron data)")
+        self.chk_nuclear.setChecked(False)
+        self.chk_nuclear.setToolTip(
+            "Use Phenix Reduce's nuclear X-H distances when adding hydrogens,\n"
+            "and the matching nuclear van der Waals radii for clashscore.\n"
+            "Unchecked: electron-cloud distances and radii.\n"
+            "When keeping existing H/D atoms, their coordinates are not rescaled;\n"
+            "select the convention appropriate for those coordinates.")
+        self.chk_flips.toggled.connect(self.update_preparation_options)
+        self.chk_keep_h.toggled.connect(self.update_preparation_options)
         self.lbl_status = QLabel("Ready")
         self.lbl_status.setStyleSheet("color: white; font-weight: bold;")
+        self.lbl_status.setWordWrap(True)
         
         # Row 1: File selection
         row1 = QHBoxLayout()
@@ -867,18 +996,30 @@ class MolProbityGUI(QMainWindow):
         self.lbl_back.setToolTip("Back to Mode Selection")
         self.lbl_back.mousePressEvent = self.go_back
 
-        # Row 2: Options, Action, and Status
+        # Row 2: File options separated from Phenix model-preparation options.
         row2 = QHBoxLayout()
         row2.addWidget(self.chk_renumber)
         row2.addWidget(self.chk_clean)
-        row2.addWidget(self.btn_run)
-        row2.addWidget(self.btn_export)
-        row2.addWidget(self.lbl_status)
-        row2.addStretch() # Pushes status to the left so it always has room to expand on the right
-        row2.addWidget(self.lbl_back) # Placed rightmost inside the input box
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.VLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        row2.addWidget(separator)
+        row2.addWidget(self.chk_flips)
+        hydrogen_options = QVBoxLayout()
+        hydrogen_options.addWidget(self.chk_keep_h)
+        hydrogen_options.addWidget(self.chk_nuclear)
+        row2.addLayout(hydrogen_options)
+        row2.addStretch()
+
+        row3 = QHBoxLayout()
+        row3.addWidget(self.btn_run)
+        row3.addWidget(self.btn_export)
+        row3.addWidget(self.lbl_status, 1)
+        row3.addWidget(self.lbl_back)
         
         input_layout.addLayout(row1)
         input_layout.addLayout(row2)
+        input_layout.addLayout(row3)
         input_group.setLayout(input_layout)
         
         main_layout.addWidget(input_group)
@@ -906,7 +1047,8 @@ class MolProbityGUI(QMainWindow):
         mp_tip = (
             "<html>"
             "For Clashscores and Molprobity scores:<br><br>"
-            "xcop gives the same values as Molprobity, but does not contain the database to rank the percentiles<br>"
+            "Values come from the selected Phenix installation; MolProbity Next uses newer Reduce2/Probe2 engines, so values may differ.<br>"
+            "xcop does not contain the database to rank the percentiles.<br>"
             "Therefore, xcop may not color the same as Molprobity<br><br>"
             "***This coloring assumes the final density map has a resolution of 3Å<br>"
             "Generally, if Molprobity score equals to the final map resolution, that means the PDB is at the 50th percentile, Caution (Yellow)<br><br>"
@@ -950,6 +1092,7 @@ class MolProbityGUI(QMainWindow):
         cols = ["Chain", "Res", "Type", "Clash > 0.4Å", "Ramachandran", "Rotamer", "Cβ dev", "CaBLAM", "Bond lengths", "Bond angles", "Cis Peptides"]
         self.table.setColumnCount(len(cols))
         self.table.setHorizontalHeaderLabels(cols)
+        self.update_chart_header_tooltips({})
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -964,6 +1107,16 @@ class MolProbityGUI(QMainWindow):
         chart_layout.addWidget(self.table)
         chart_group.setLayout(chart_layout)
         main_layout.addWidget(chart_group, 1)
+
+    def update_preparation_options(self):
+        # Both modes cannot be promised together: Phenix flips regenerate H/D.
+        self.chk_flips.setEnabled(not self.chk_keep_h.isChecked())
+        self.chk_keep_h.setEnabled(not self.chk_flips.isChecked())
+        self.chk_renumber.setEnabled(not self.chk_keep_h.isChecked())
+
+    def update_chart_header_tooltips(self, residues):
+        for column, tooltip in chart_category_tooltips(residues).items():
+            self.table.horizontalHeaderItem(column).setToolTip(tooltip)
 
     def go_back(self, event):
         self.launcher = LauncherWindow()
@@ -1010,7 +1163,11 @@ class MolProbityGUI(QMainWindow):
             return
 
         self.btn_run.setEnabled(False)
+        for checkbox in (self.chk_renumber, self.chk_clean, self.chk_flips,
+                         self.chk_keep_h, self.chk_nuclear):
+            checkbox.setEnabled(False)
         self.table.setRowCount(0)
+        self.update_chart_header_tooltips({})
         for lbl in self.metrics_labels.values():
             lbl.setText("-")
             lbl.setStyleSheet("background-color: #333; border: 1px solid #555; padding: 2px; border-radius: 3px;")
@@ -1018,7 +1175,11 @@ class MolProbityGUI(QMainWindow):
         self.worker_thread = QThread()
         renum = self.chk_renumber.isChecked()
         clean = self.chk_clean.isChecked()
-        self.worker = AnalysisWorker(self.backend, path, renum, clean)
+        self.worker = AnalysisWorker(
+            self.backend, path, renum, clean,
+            allow_flips=self.chk_flips.isChecked(),
+            keep_hydrogens=self.chk_keep_h.isChecked(),
+            nuclear=self.chk_nuclear.isChecked())
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
         self.worker.status_update.connect(self.update_status)
@@ -1035,6 +1196,12 @@ class MolProbityGUI(QMainWindow):
 
     def analysis_finished(self, success):
         self.btn_run.setEnabled(True)
+        for checkbox in (self.chk_renumber, self.chk_clean, self.chk_flips,
+                         self.chk_keep_h, self.chk_nuclear):
+            checkbox.setEnabled(True)
+        self.update_preparation_options()
+        if success:
+            self.lbl_status.setText("Analysis complete")
 
     def populate_metrics(self):
         d = self.backend.summary_data
@@ -1171,6 +1338,8 @@ class MolProbityGUI(QMainWindow):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     self.table.setItem(row, col, item)
 
+            self.update_chart_header_tooltips(self.backend.residue_data)
+
         finally:
             self.table.setSortingEnabled(True)
             self.table.resizeRowsToContents()
@@ -1259,6 +1428,13 @@ class MolProbityGUI(QMainWindow):
 
         html.append("</head><body>")
 
+        settings = self.backend.summary_data.get('validation_options')
+        if settings is not None:
+            flips = "Allowed (Phenix Reduce)" if settings.get('allow_flips') else "Keep as deposited"
+            hydrogens = "Keep existing H/D" if settings.get('keep_hydrogens') else "Regenerate with Phenix Reduce"
+            distances = "Nuclear" if settings.get('nuclear') else "Electron-cloud"
+            html.append(f"<p>Asn/Gln/His: {flips}; Hydrogens: {hydrogens}; X-H convention: {distances}.</p>")
+
         if opts.get("summary"):
             html.append("<h2>MolProbity Summary Statistics</h2>")
             html.append("<div class='summary'>")
@@ -1284,7 +1460,10 @@ class MolProbityGUI(QMainWindow):
             
             for c in range(self.table.columnCount()):
                 click_attr = f" onclick='sortTable({c})'" if opts.get("interactive") else ""
-                html.append(f"<th{click_attr}>{self.table.horizontalHeaderItem(c).text()}</th>")
+                header_item = self.table.horizontalHeaderItem(c)
+                tooltip = escape_html(header_item.toolTip(), quote=True).replace("\n", "&#10;")
+                title_attr = f' title="{tooltip}"' if tooltip else ""
+                html.append(f"<th{click_attr}{title_attr}>{escape_html(header_item.text())}</th>")
             html.append("</tr>")
             
             for r in range(self.table.rowCount()):
