@@ -1,6 +1,6 @@
-"""Standalone XCOP Modifier with the Amyloid Modifier 2.1.3 engine.
+"""Standalone XCOP Modifier with the Amyloid Modifier 2.2.2 engine.
 
-Structure I/O and geometry are kept in sync with the 2.1.3 bundle. The cluster
+Structure I/O and geometry are kept in sync with the 2.2.2 bundle. The cluster
 preview and file workflow remain standalone; no ChimeraX package is required.
 The optional secondary-structure button retains the existing external Chimera
 workflow. Expansion itself does not invoke Chimera or ChimeraX.
@@ -26,7 +26,7 @@ from typing import NamedTuple
 from collections import Counter, defaultdict
 
 
-VERSION = '2.1.3'
+VERSION = '2.2.2'
 # Below this per-cycle angle, a free rotation axis is dominated by coordinate
 # rounding/noise. Use the measured repeat direction to constrain the rotation.
 MIN_RESOLVED_ROTATION_DEGREES = 0.05
@@ -757,43 +757,58 @@ class StructureEditor:
                 phase = phases[site['identity'], period].most_common(1)[0][0]
                 for residue in site['residues']:
                     layer = phase + period * round((residue['layer'] - phase) / period)
-                    residue['layer'] = min(len(sandwiches[0]) - 1, max(0, layer))
+                    residue['layer'] = min(len(sandwiches[site['pf']]) - 1, max(0, layer))
         return sites
 
-    def associated_residues_for_layers(self, sandwiches, keep_indices, axis, axial_limit=4.0):
+    def associated_residues_for_layers(self, sandwiches, keep_indices, axis, axial_limit=4.0,
+                                       *, keep_chains=None):
         # Keep complete ligand repeats when trimming protein layers.
         _, np = _structure_dependencies()
-        kept = set(keep_indices)
+        if keep_chains is None:
+            indices = set(keep_indices)
+            kept_by_pf = [{i for i in indices if 0 <= i < len(s)} for s in sandwiches]
+        else:
+            keep_chains = set(keep_chains)
+            kept_by_pf = [{i for i, c in enumerate(s) if c in keep_chains} for s in sandwiches]
         core = {c for s in sandwiches for c in s}
-        kept_chains = {s[i] for s in sandwiches for i in kept if 0 <= i < len(s)}
+        kept_chains = {s[i] for s, kept in zip(sandwiches, kept_by_pf) for i in kept}
         owners = self.associated_residues(core, axial_limit, axis)
         attached = self.covalent_residue_owners()
         owners.update(attached)
         result = {r for r, c in owners.items() if c in kept_chains}
-        if not kept or axis is None or len(sandwiches[0]) < 2:
+        if not kept_chains or axis is None or not any(len(s) >= 2 for s in sandwiches):
             return result
         ca = self.ca_chains()
         axis = np.asarray(axis, dtype=float)
         axis /= np.linalg.norm(axis)
-        centers = [np.mean([r['coord'] for s in sandwiches for r in ca[s[i]]], axis=0)
-                   for i in range(len(sandwiches[0]))]
-        rise = float(np.median(np.abs(np.diff(np.array(centers) @ axis))))
+        # Measure within each stack: unequal ends must not mix unrelated indices
+        # or shift a layer centroid when a shorter protofilament runs out.
+        spacings = []
+        for stack in sandwiches:
+            centers = np.array([np.mean([r['coord'] for r in ca[c]], axis=0) for c in stack])
+            spacings.extend(np.abs(np.diff(centers @ axis)))
+        rise = float(np.median(spacings))
         if rise < 1e-8:
             return result
         sites = self.associated_residue_repeats(sandwiches, axis, rise, axial_limit)
-        midpoint = float(np.mean(sorted(kept)))
         for site in sites:
+            kept = kept_by_pf[site['pf']]
+            depth = len(sandwiches[site['pf']])
+            if not kept:
+                result.difference_update(k for r in site['residues'] for k in r['keys'])
+                continue
+            midpoint = float(np.mean(sorted(kept)))
             if site.get('terminal_track') and kept == set(range(min(kept), max(kept) + 1)):
                 members = sorted(site['residues'], key=lambda r: r['layer'])
                 result.difference_update(k for r in members for k in r['keys'])
-                end = max(0, len(members) - (len(sandwiches[0]) - 1 - max(kept)))
+                end = max(0, len(members) - (depth - 1 - max(kept)))
                 result.update(k for r in members[min(kept):end] for k in r['keys'])
                 continue
             if site['period'] == 1:
                 continue
             members = site['residues']
             result.difference_update(k for r in members for k in r['keys'])
-            removed_repeats = len(sandwiches[0]) // site['period'] - len(kept) // site['period']
+            removed_repeats = depth // site['period'] - len(kept) // site['period']
             count = max(1, len(members) - removed_repeats)
             eligible = [r for r in members if min(abs(r['layer'] - i) for i in kept) <= site['period'] / 2]
             eligible.sort(key=lambda r: (abs(r['layer'] - midpoint), r['layer']))
@@ -3273,6 +3288,59 @@ def expand_structure_layers(editor, sandwiches, layers_to_add, use_auto, manual_
     return twist, rise, axis, tilt
 
 
+def protofilament_selection_targets(editor, detection, axial_limit=4.0):
+    """Residue-exact targets; author chains can contain both protein and ligand."""
+    _, np = _structure_dependencies()
+    stacks = detection['sandwiches']
+    first = [r for r in editor.atoms if str(r['pdbx_PDB_model_num']) == editor.models[0]]
+    targets = []
+    for i, stack in enumerate(stacks):
+        targets.append(dict(kind='protein', pf=i,
+            label=f'Protein protofilament with Chain {stack[len(stack)//2]}',
+            residues=frozenset(_residue_key(r) for r in first
+                if r['auth_asym_id'] in stack and r['label_asym_id'] in editor.protein_labels)))
+
+    # Reuse the editor's site/occupancy detection, retaining complete RNA/DNA
+    # molecules too. Waters and monatomic ions are not ligand protofilaments.
+    molecules = [rows for rows in editor.companion_groups()
+                 if len({r['label_atom_id'] for r in rows}) > 1
+                 and rows[0]['label_comp_id'] not in ('HOH', 'WAT', 'DOD')]
+    eligible = {_residue_key(r) for rows in molecules for r in rows}
+    rises = [p['unit_rise'] for p in detection['protofilaments'] if p['unit_rise']]
+    sites = (editor.associated_residue_repeats(stacks, detection['axis'],
+                float(np.median(rises)), axial_limit)
+             if rises and detection['axis'] is not None else [])
+    assigned = set()
+    for site in sites:
+        keys = frozenset(k for member in site['residues'] for k in member['keys']) & eligible
+        if keys:
+            targets.append(dict(kind='ligand', residues=keys, copies=len(site['residues'])))
+            assigned.update(keys)
+    # Do not silently omit molecules outside the axial association window or
+    # in a one-layer fragment where the stacking axis cannot be determined.
+    for rows in molecules:
+        keys = frozenset(_residue_key(r) for r in rows)
+        if not keys & assigned:
+            targets.append(dict(kind='ligand', residues=keys, copies=1))
+    for number, target in enumerate((t for t in targets if t['kind'] == 'ligand'), 1):
+        keys = sorted(target['residues'])
+        names = '/'.join(sorted({k[-1] for k in keys}))
+        anchor = keys[0]
+        target['label'] = (f'Ligand {names} site {number} ({target["copies"]} copies; '
+                           f'{anchor[0]}:{anchor[1]}{anchor[2]})')
+    return targets
+
+
+def trim_ligand_target(editor, target):
+    keys = target['residues']
+    if keys & editor.covalent_residue_owners().keys():
+        raise StructureEditError('This ligand site is covalently attached to protein; it cannot be trimmed independently.')
+    rows = [r for r in editor.atoms if _residue_key(r) not in keys]
+    editor.report['operation'] = 'trim ligand site'
+    return editor.apply_copies([dict(chains={r['auth_asym_id']: r['auth_asym_id'] for r in rows},
+                                    atom_ids={r['id'] for r in rows})])
+
+
 def new_source_notices(owner, report):
     """Display each source issue once per explicit load; keep the full audit."""
     seen = getattr(owner, '_shown_source_notices', None)
@@ -4325,7 +4393,7 @@ def open_modifier_layer_viewer(launch=True):
 
             hb_trim = QHBoxLayout()
             self.btn_trim = QPushButton("Trim/Expand Layers")
-            self.btn_trim.setToolTip("Trim or expand the structure to the target number of layers")
+            self.btn_trim.setToolTip("Trim each protofilament to at most the target number of layers, or expand to the target")
             self.btn_trim.clicked.connect(self.action_trim)
             hb_trim.addWidget(self.btn_trim)
             hb_trim.addWidget(QLabel("Target Layers:"))
@@ -4338,7 +4406,7 @@ def open_modifier_layer_viewer(launch=True):
 
             hb_pf_trim = QHBoxLayout()
             self.btn_remove_pf = QPushButton("Trim Protofilament")
-            self.btn_remove_pf.setToolTip("Trim away the selected protofilament entirely")
+            self.btn_remove_pf.setToolTip("Trim away the selected protein protofilament or unattached ligand site")
             self.btn_remove_pf.clicked.connect(self.action_remove_pf)
             hb_pf_trim.addWidget(self.btn_remove_pf)
             self.cmb_protofilaments = QComboBox()
@@ -4526,12 +4594,13 @@ def open_modifier_layer_viewer(launch=True):
             except ValueError:
                 return default
         
-        def get_kept_heteroatoms(self, keep_layer_indices, xy_limit, water_z_limit):
+        def get_kept_heteroatoms(self, keep_layer_indices, xy_limit, water_z_limit, *, keep_chains=None):
             if not self.working_file_path or not self.final_sandwiches:
                 return set()
             editor = StructureEditor(self.working_file_path)
             axis = (getattr(self, 'detection_result', None) or {}).get('axis')
-            return editor.associated_residues_for_layers(self.final_sandwiches, keep_layer_indices, axis, water_z_limit)
+            return editor.associated_residues_for_layers(self.final_sandwiches, keep_layer_indices, axis,
+                                                        water_z_limit, keep_chains=keep_chains)
 
         # ================= LOGIC: FILE HANDLING =================
 
@@ -4775,10 +4844,25 @@ def open_modifier_layer_viewer(launch=True):
             if self.cmb_protofilaments.count() == 0: return
             
             try:
-                pf_index = self.cmb_protofilaments.currentData()
+                target = self.cmb_protofilaments.currentData()
+                if target is None:
+                    return
+                if target['kind'] == 'ligand':
+                    editor = StructureEditor(self.working_file_path)
+                    trim_ligand_target(editor, target)
+                    fmt = 'cif' if self.working_file_path.lower().endswith(('.cif', '.mmcif')) else 'pdb'
+                    output = os.path.join(os.path.dirname(self.working_file_path),
+                                          f'temp_trimmed_ligand_{uuid.uuid4().hex[:8]}.{fmt}')
+                    self.created_temp_files.append(output)
+                    editor.write(output, format=fmt)
+                    self._adopt_working_file(output)
+                    self.operation_log('Trimmed ' + target['label'])
+                    self.process_pdb(output)
+                    return
+                target_chains = {key[0] for key in target['residues']}
+                pf_index = next((i for i, stack in enumerate(self.final_sandwiches)
+                                 if target_chains.intersection(stack)), None)
                 if pf_index is None or pf_index < 0 or pf_index >= len(self.final_sandwiches): return
-                
-                total_layers = self.detected_units
                 keep_chains = set()
                 
                 for i, sandwich in enumerate(self.final_sandwiches):
@@ -4832,8 +4916,11 @@ def open_modifier_layer_viewer(launch=True):
             needs_completion = not self.detection_result['complete']
             if target_layers == self.detected_layers and not needs_completion:
                 return
-            if needs_completion and not (terminal_completion_supported(self.detection_result)
-                                         and target_layers >= self.detected_layers):
+            if target_layers < self.detected_layers and (self.layers_per_unit is None or
+                    any(not track['complete'] for track in self.detection_result['protofilaments'])):
+                QMessageBox.warning(self, "Incomplete stacks", "Layer trimming requires contiguous protofilaments with the same number of layers per chain. Unequal protofilament lengths are supported; internal gaps and inconsistent layer multiplicity must be resolved first.")
+                return
+            if target_layers >= self.detected_layers and needs_completion and not terminal_completion_supported(self.detection_result):
                 QMessageBox.warning(self, "Incomplete stacks", "Automatic terminal completion requires contiguous stacks with a supported orientation motif and one layer per chain. Parallel stacks need at least two chains and may lack up to two terminal chains; other supported motifs need at least three chains and may lack one. Choose a target at least as large as the longest stack. Internal gaps and ambiguous stacks cannot be completed automatically.")
                 return
             unit_layers = self.layers_per_unit or 1
@@ -4848,13 +4935,15 @@ def open_modifier_layer_viewer(launch=True):
                 self.created_temp_files.append(output)
                 water_limit = self.get_param(self.edit_water_z, 4.0)
                 if target_units < self.detected_units:
-                    start = (self.detected_units - target_units) // 2
-                    indices = range(start, start + target_units)
-                    keep = {s[i] for s in self.final_sandwiches for i in indices}
-                    companions = self.get_kept_heteroatoms(indices, 3.0, water_limit)
+                    keep = set()
+                    for stack in self.final_sandwiches:
+                        count = min(len(stack), target_units)
+                        start = (len(stack) - count) // 2
+                        keep.update(stack[start:start + count])
+                    companions = self.get_kept_heteroatoms(None, 3.0, water_limit, keep_chains=keep)
                     writer = self.write_trimmed_cif if fmt == 'cif' else self.write_trimmed_pdb
                     writer(source, output, keep, companions)
-                    message = f'Trimming complete: {target_layers} layers per protofilament.'
+                    message = f'Trimming complete: at most {target_layers} layers per protofilament.'
                 else:
                     dialog = self.ExpandDialog(self.detected_units, self)
                     if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -5377,6 +5466,13 @@ rc("close session")
                     lines.append('Stacking axis (' + result['axis_source'] + '): [' + ', '.join(f'{v:.4f}' for v in result['axis']) + ']')
                 for i, track in enumerate(result['protofilaments']):
                     lines.append(f"\nProtofilament #{i+1} ({track['orientation']}): {track['units']} units × {track['layers_per_unit']} layers/unit = {track['layers']} layers")
+                    period = result['suggested_repeat_units']
+                    if track['orientation'] == 'antiparallel' and track['complete'] and period > 1:
+                        repeats, remainder = divmod(track['units'], period)
+                        summary = f"Repeat units: {repeats} complete × {period} chains/repeat"
+                        if remainder:
+                            summary += f" + {remainder} unpaired chain units"
+                        lines.append(summary)
                     lines.append(', '.join(track['chains']))
                     if not track['complete']:
                         lines.append(f"Unit positions: {track['unit_positions']}; axial span: {track['axial_layer_span']} layers")
@@ -5389,8 +5485,10 @@ rc("close session")
                 self.btn_beta.setEnabled(self.detected_layers > 1)
                 self.cmb_protofilaments.blockSignals(True)
                 self.cmb_protofilaments.clear()
-                for i, pf in enumerate(self.final_sandwiches):
-                    self.cmb_protofilaments.addItem(f'Protofilament with Chain {pf[len(pf)//2]}', userData=i)
+                for target in protofilament_selection_targets(editor, result, self.get_param(self.edit_water_z, 4.0)):
+                    self.cmb_protofilaments.addItem(target['label'], userData=target)
+                    self.cmb_protofilaments.setItemData(self.cmb_protofilaments.count() - 1,
+                        target['label'], Qt.ItemDataRole.ToolTipRole)
                 self.cmb_protofilaments.blockSignals(False)
                 highlights = {s[len(s)//2] for s in self.final_sandwiches}
                 self.mol_canvas.plot_chains(self.chains_data_plot, label_ids=highlights, waters=waters, ions=ions)

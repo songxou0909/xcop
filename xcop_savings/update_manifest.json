@@ -59,7 +59,7 @@
       "preserve": [
         "shebang"
       ],
-      "sha256": "32b8c56513e4921d05af6a364d8b125c9e38c5906c7c6151542c656083066f9a"
+      "sha256": "7ae5a37fbc5adb6f01c7c3b58ff8e4c5566f5902c65061b769e2e1be6d8c7cde"
     },
     {
       "path": "xcop_savings/queue_monitor.py",
