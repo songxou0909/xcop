@@ -81,7 +81,7 @@
       "preserve": [
         "shebang"
       ],
-      "sha256": "75655bb93d29a3c1ae32b4e549fcfc6cf1a490b17e82a3cf17b8919e179050b4"
+      "sha256": "fecbfb3f028419fa07bd6b6f971e85a336a4acf9ca354abc50faa536148a616c"
     },
     {
       "path": "xcop_savings/validation.py",

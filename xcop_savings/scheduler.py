@@ -18,7 +18,7 @@ base_path = os.path.dirname(os.path.abspath(__file__))
 
 # Standard RELION job types to search through
 JOB_TYPES = [
-    "Import", "Select", "MaskCreate", "ModelAngelo", "MotionCorr", "Extract", "Class3D", 
+    "Import", "Select", "MaskCreate", "ModelAngelo", "MotionCorr", "Extract", "Class2D", "Class3D", 
     "PostProcess", "External", "DynaMight", "Refine3D", "CtfRefine", "Substract", "LocalRes", 
     "CtfFind", "ManualPick", "AutoPick", "InitialModel", "Polish", "JoinStar"
 ]
