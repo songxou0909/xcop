@@ -5,6 +5,8 @@ import csv
 import shutil
 import argparse
 
+import subprocess
+
 from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QLineEdit, 
                              QPushButton, QTextEdit, QMessageBox, QFileDialog, 
                              QVBoxLayout, QHBoxLayout, QSizePolicy, QSlider,
@@ -12,10 +14,181 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QLineEdit,
                              QCheckBox, QTableWidget, QHeaderView, QTableWidgetItem, 
                              QTextBrowser, QDialog, QTabWidget, QComboBox,
                              QTableView, QAbstractItemView, QScrollArea,
-                             QDoubleSpinBox, QColorDialog)
+                             QDoubleSpinBox, QColorDialog, QGridLayout)
 from PyQt6.QtCore import (Qt, QTimer, QSize, QAbstractTableModel,
                           QModelIndex, QProcess, QPointF, pyqtSignal)
-from PyQt6.QtGui import QColor, QImage, QPixmap
+from PyQt6.QtGui import QColor, QImage, QPixmap, QPainter, QPen
+
+# One-time Slurm partition selection (kept in this standalone script).
+def parse_partitions(output):
+    names = []
+    for line in output.splitlines():
+        name = line.strip().rstrip("*")
+        if name and not any(char.isspace() for char in name) and name not in names:
+            names.append(name)
+    return names
+
+
+def available_partitions():
+    result = subprocess.run(["sinfo", "--noheader", "--format=%P"],
+                            capture_output=True, text=True, timeout=5, check=True)
+    names = parse_partitions(result.stdout)
+    if not names:
+        raise ValueError("sinfo returned no partitions.")
+    return names
+
+
+class PartitionComboBox(QComboBox):
+    """A non-editable list with an arrow visible under each tool's theme."""
+    def __init__(self):
+        super().__init__()
+        self.setEditable(False)
+        self.setMaxVisibleItems(20)
+        self.setStyleSheet("""
+            QComboBox { padding-right: 28px; }
+            QComboBox::drop-down { width: 24px; border-left: 1px solid #555; }
+            QComboBox::down-arrow { image: none; }
+        """)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(self.palette().text().color(), 1.8))
+        painter.setOpacity(1.0 if self.isEnabled() else 0.5)
+        x, y = self.width() - 13, self.height() // 2
+        painter.drawLine(x - 4, y - 2, x, y + 2)
+        painter.drawLine(x, y + 2, x + 4, y - 2)
+
+
+class PartitionDialog(QDialog):
+    def __init__(self, defaults, parent=None, *, names=None, error="", action_label="Submit Job"):
+        super().__init__(parent)
+        self.setWindowTitle("Select Partition")
+        self.setMinimumWidth(390)
+        self.defaults = dict(defaults)
+        self.combos = {}
+        self.names = []
+        layout = QGridLayout(self)
+        for row, label in enumerate(defaults):
+            combo = PartitionComboBox()
+            combo.setPlaceholderText("Loading partitions...")
+            combo.setEnabled(False)
+            self.combos[label] = combo
+            layout.addWidget(QLabel(label + ":"), row, 0)
+            layout.addWidget(combo, row, 1, 1, 2)
+        row = len(defaults)
+        self.error_label = QLabel()
+        self.error_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.error_label.setWordWrap(True)
+        self.error_label.hide()
+        layout.addWidget(self.error_label, row, 0, 1, 3)
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.setAutoDefault(False)
+        self.submit_button = QPushButton(action_label)
+        self.submit_button.setDefault(True)
+        self.submit_button.setEnabled(False)
+        cancel = QPushButton("Cancel")
+        cancel.setAutoDefault(False)
+        layout.addWidget(self.refresh_button, row + 1, 0)
+        layout.addWidget(self.submit_button, row + 1, 1)
+        layout.addWidget(cancel, row + 1, 2)
+        layout.setColumnStretch(1, 1)
+        self.process = QProcess(self)
+        self.process.finished.connect(self.loaded)
+        self.process.errorOccurred.connect(self.failed)
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.process.kill)
+        self.refresh_button.clicked.connect(self.refresh)
+        self.submit_button.clicked.connect(self.accept)
+        cancel.clicked.connect(self.reject)
+        if names is None:
+            QTimer.singleShot(0, self.refresh)
+        else:
+            self.populate(names, error)
+
+    def populate(self, names, error=""):
+        self.names = list(names)
+        for label, combo in self.combos.items():
+            current = combo.currentText() or self.defaults[label]
+            combo.clear()
+            combo.addItems(names)
+            if current in names:
+                combo.setCurrentText(current)
+            combo.setEnabled(bool(names))
+            combo.setPlaceholderText("Partitions unavailable")
+        self.submit_button.setEnabled(bool(names))
+        self.error_label.setText(error)
+        self.error_label.setVisible(bool(error))
+        self.refresh_button.setText("Refresh")
+        self.refresh_button.setEnabled(True)
+
+    def refresh(self):
+        self.error_label.hide()
+        self.refresh_button.setEnabled(False)
+        self.refresh_button.setText("Loading...")
+        self.submit_button.setEnabled(False)
+        self.timer.start(5000)
+        self.process.start("sinfo", ["--noheader", "--format=%P"])
+
+    def failed(self, error):
+        self.timer.stop()
+        self.populate([], "Could not load partitions from sinfo. Click Refresh to retry.")
+
+    def loaded(self, code, status):
+        self.timer.stop()
+        output = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        names = parse_partitions(output)
+        if code or status != QProcess.ExitStatus.NormalExit or not names:
+            self.failed(None)
+        else:
+            self.populate(names)
+
+    def selections(self):
+        return {label: combo.currentText() for label, combo in self.combos.items()}
+
+    def done(self, result):
+        self.timer.stop()
+        if self.process.state() != QProcess.ProcessState.NotRunning:
+            self.process.kill()
+            self.process.waitForFinished(1000)
+        super().done(result)
+
+
+def resolve_partitions(defaults, parent=None, *, force=False, action_label="Submit Job"):
+    """Keep available defaults on left-click; otherwise ask, without saving choices."""
+    names, error = None, ""
+    if not force:
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            names = available_partitions()
+        except (OSError, subprocess.SubprocessError, ValueError):
+            names = []
+            error = "Could not load partitions from sinfo. Click Refresh to retry."
+        finally:
+            QApplication.restoreOverrideCursor()
+        if names and all(value in names for value in defaults.values()):
+            return dict(defaults)
+    dialog = PartitionDialog(defaults, parent, names=names, error=error, action_label=action_label)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return dialog.selections()
+
+
+def resolve_partition(default, parent=None, *, force=False, action_label="Submit Job"):
+    result = resolve_partitions({"Partition": default}, parent, force=force, action_label=action_label)
+    return None if result is None else result["Partition"]
+
+
+def bind_partition_menu(button, action, allowed=None):
+    button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+    button.customContextMenuRequested.connect(
+        lambda _pos: action() if button.isEnabled() and (allowed is None or allowed()) else None
+    )
+    tip = button.toolTip()
+    button.setToolTip((tip + "\n" if tip else "") + "Right-click to choose a partition for this run.")
+
 
 # Pyqtgraph caches OpenGL shader program IDs at class level. Top-level
 # QOpenGLWidgets must share resources or a shader compiled by the main preview
@@ -4183,6 +4356,8 @@ rc("close session")
             self.btn_run_rfd3 = QPushButton("Run RFD3")
             self.btn_run_rfd3.setToolTip("Design backbones")
             self.btn_run_rfd3.clicked.connect(self.run_rfd3)
+            bind_partition_menu(self.btn_run_rfd3, lambda: self.run_with_partition(
+                self.btn_run_rfd3, "Run RFD3", self.run_rfd3))
             rfd3_form.addRow("", self.btn_run_rfd3)
             rfd3_main_layout.addLayout(rfd3_form)
             left_layout.addWidget(rfd3_group)
@@ -4198,6 +4373,8 @@ rc("close session")
             self.btn_run_mpnn = QPushButton("Run MPNN")
             self.btn_run_mpnn.setToolTip("Assign sequences to the backbones")
             self.btn_run_mpnn.clicked.connect(self.run_mpnn)
+            bind_partition_menu(self.btn_run_mpnn, lambda: self.run_with_partition(
+                self.btn_run_mpnn, "Run MPNN", self.run_mpnn))
             mpnn_layout.addRow("", self.btn_run_mpnn)
             left_layout.addWidget(mpnn_group)
 
@@ -4207,6 +4384,8 @@ rc("close session")
             self.btn_run_rf3 = QPushButton("Run RF3")
             self.btn_run_rf3.setToolTip("Fold and simulate binding of the designed sequences on the target protein")
             self.btn_run_rf3.clicked.connect(self.run_rf3)
+            bind_partition_menu(self.btn_run_rf3, lambda: self.run_with_partition(
+                self.btn_run_rf3, "Run RF3", self.run_rf3))
             rf3_layout.addWidget(self.btn_run_rf3)
             left_layout.addWidget(rf3_group)
 
@@ -4217,6 +4396,8 @@ rc("close session")
             self.btn_submit_val = QPushButton("Run CPU Validation Array")
             self.btn_submit_val.setObjectName("submitValidationButton")
             self.btn_submit_val.clicked.connect(self.run_validation_slurm)
+            bind_partition_menu(self.btn_submit_val, lambda: self.run_with_partition(
+                self.btn_submit_val, "Run CPU Validation Array", self.run_validation_slurm))
             self.btn_submit_val.setToolTip(
                 "Generate the raw score CSV files used by the thresholds below."
             )
@@ -4305,6 +4486,7 @@ rc("close session")
                 "after the preceding SLURM array succeeds."
             )
             self.btn_auto_run.clicked.connect(self.auto_run_pipeline)
+            bind_partition_menu(self.btn_auto_run, lambda: self.auto_run_pipeline(force_partition=True))
             self.btn_cancel_jobs = QPushButton("Cancel Running Jobs")
             self.btn_cancel_jobs.setObjectName("cancelJobsButton")
             self.btn_cancel_jobs.setToolTip(
@@ -5941,7 +6123,20 @@ rc("close session")
                 QMessageBox.critical(self, "System Error", f"Command not found: {cmd_list[0]}\nAre you running this on the HPC login node?")
                 return False
 
-        def run_rfd3(self):
+        def run_with_partition(self, button, label, action):
+            partition = resolve_partition("cpu" if button == self.btn_submit_val else "normal",
+                                          self, force=True)
+            if partition is None:
+                return
+            if button.property("job_state") in {"FAILED", "CANCELLED", "COMPLETED"}:
+                self.prepare_step_rerun(button, label)
+            action(partition=partition)
+
+        def run_rfd3(self, _checked=False, *, force_partition=False, partition=None):
+            if partition is None:
+                partition = resolve_partition("normal", self, force=force_partition)
+            if partition is None:
+                return
             if not getattr(self.mol_canvas, 'selected_indices', set()):
                 self.right_tabs.setCurrentIndex(0)
                 QMessageBox.warning(
@@ -5971,11 +6166,16 @@ rc("close session")
             # Hardcode the GPU inference batch size to 1 (prevents GPU memory crashes)
             internal_gpu_batch_size = 1 
             
-            self._write_rfd3_scripts(pwd, input_json, num_designs, internal_gpu_batch_size, array_limit)
+            self._write_rfd3_scripts(pwd, input_json, num_designs, internal_gpu_batch_size, array_limit,
+                                     partition=partition)
             self.execute_command(["sbatch", "scripts/submit_rfd3.sh"], pwd, "RFD3 Job Submitted Successfully.", "rfd3", self.btn_run_rfd3, "Run RFD3")
 
-        def auto_run_pipeline(self):
+        def auto_run_pipeline(self, _checked=False, *, force_partition=False):
             """Submit compute stages, reusing passed backbones for iterations."""
+            partitions = resolve_partitions({"GPU stages": "normal", "CPU validation": "cpu"},
+                                            self, force=force_partition, action_label="Submit Jobs")
+            if partitions is None:
+                return
             pwd = self._check_workspace()
             if not pwd:
                 return
@@ -6036,16 +6236,18 @@ rc("close session")
                         self.num_designs_spin.value(),
                         1,
                         array_limit,
+                        partition=partitions["GPU stages"],
                     )
                 self._write_mpnn_scripts(
                     pwd, self.seqs_per_struct_spin.value(), array_limit,
                     batch_ids=iteration_batches,
+                    partition=partitions["GPU stages"],
                 )
                 self._write_rf3_scripts(
-                    pwd, array_limit, batch_ids=iteration_batches
+                    pwd, array_limit, batch_ids=iteration_batches, partition=partitions["GPU stages"]
                 )
                 self._write_validation_scripts(
-                    pwd, array_limit, batch_ids=iteration_batches
+                    pwd, array_limit, batch_ids=iteration_batches, partition=partitions["CPU validation"]
                 )
 
                 stages = (
@@ -6296,7 +6498,11 @@ rc("close session")
                     "HPC login node?",
                 )
 
-        def run_mpnn(self):
+        def run_mpnn(self, _checked=False, *, force_partition=False, partition=None):
+            if partition is None:
+                partition = resolve_partition("normal", self, force=force_partition)
+            if partition is None:
+                return
             pwd = self._check_workspace()
             if not pwd: return
             rfd3_dir = os.path.join(pwd, "rfd3_outputs")
@@ -6313,10 +6519,14 @@ rc("close session")
                 return
             array_limit = len(batches) - 1
             seqs = self.seqs_per_struct_spin.value()
-            self._write_mpnn_scripts(pwd, seqs, array_limit)
+            self._write_mpnn_scripts(pwd, seqs, array_limit, partition=partition)
             self.execute_command(["sbatch", "scripts/submit_mpnn.sh"], pwd, "MPNN Job Submitted Successfully.", "mpnn", self.btn_run_mpnn, "Run MPNN")
 
-        def run_rf3(self):
+        def run_rf3(self, _checked=False, *, force_partition=False, partition=None):
+            if partition is None:
+                partition = resolve_partition("normal", self, force=force_partition)
+            if partition is None:
+                return
             pwd = self._check_workspace()
             if not pwd: return
             mpnn_dir = os.path.join(pwd, "mpnn_outputs")
@@ -6332,10 +6542,14 @@ rc("close session")
                 )
                 return
             array_limit = len(batches) - 1
-            self._write_rf3_scripts(pwd, array_limit)
+            self._write_rf3_scripts(pwd, array_limit, partition=partition)
             self.execute_command(["sbatch", "scripts/submit_rf3.sh"], pwd, "RF3 Validation Job Submitted Successfully.", "rf3", self.btn_run_rf3, "Run RF3")
 
-        def run_validation_slurm(self):
+        def run_validation_slurm(self, _checked=False, *, force_partition=False, partition=None):
+            if partition is None:
+                partition = resolve_partition("cpu", self, force=force_partition)
+            if partition is None:
+                return
             pwd = self._check_workspace()
             if not pwd: return
             rf3_dir = os.path.join(pwd, "rf3_outputs")
@@ -6351,7 +6565,7 @@ rc("close session")
                 )
                 return
             array_limit = len(batches) - 1
-            self._write_validation_scripts(pwd, array_limit)
+            self._write_validation_scripts(pwd, array_limit, partition=partition)
             self.execute_command(["sbatch", "scripts/submit_validation_cpu.sh"], pwd, "Validation Calculation Job Submitted.", "validation", self.btn_submit_val, "Run CPU Validation Array")
 
         def run_consolidation_local(self):
@@ -6693,13 +6907,13 @@ rc("close session")
                 f"available on PATH.\n\n{error_text}",
             )
 
-        def _write_rfd3_scripts(self, base_dir, input_json, num_designs, batch_size, array_limit):
+        def _write_rfd3_scripts(self, base_dir, input_json, num_designs, batch_size, array_limit, *, partition="normal"):
             run_rfd3_code = '''import argparse\nimport os\nfrom lightning.fabric import seed_everything\nfrom rfd3.engine import RFD3InferenceConfig, RFD3InferenceEngine\n\nparser = argparse.ArgumentParser()\nparser.add_argument("--input_json", type=str, required=True)\nparser.add_argument("--num_designs", type=int, default=10)\nparser.add_argument("--batch_size", type=int, default=1)\nparser.add_argument("--out_dir", type=str, default="./rfd3_outputs")\nargs = parser.parse_args()\n\nnum_batches = (args.num_designs + args.batch_size - 1) // args.batch_size\nos.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"\nseed_everything(0)\n\nconfig = RFD3InferenceConfig(specification={'extra': {}}, diffusion_batch_size=args.batch_size)\nmodel = RFD3InferenceEngine(**config)\nmodel.run(inputs=args.input_json, out_dir=args.out_dir, n_batches=num_batches)\n'''
             with open(os.path.join(base_dir, "scripts", "run_rfd3.py"), "w") as f: f.write(run_rfd3_code)
-            slurm_rfd3_code = f'''#!/bin/bash\n#SBATCH --job-name=rfd3_gen\n#SBATCH --output=logs/%x_%A_%a.out\n#SBATCH --error=logs/%x_%A_%a.err\n#SBATCH --ntasks=1\n#SBATCH --cpus-per-task=4\n#SBATCH --mem=32G\n#SBATCH --time=24:00:00\n#SBATCH --partition=normal\n#SBATCH --gres=gpu:1\n#SBATCH --array=0-{array_limit}%8\n#SBATCH --export=NONE\n\nset -eo pipefail\n\nmkdir -p logs\neval "$(conda shell.bash hook)"\nconda activate rfdxcop\n\npython scripts/run_rfd3.py \\\n        --input_json "{input_json}" \\\n        --num_designs {num_designs} \\\n        --batch_size {batch_size} \\\n        --out_dir ./rfd3_outputs/batch_${{SLURM_ARRAY_TASK_ID}}\n\nfind ./rfd3_outputs/batch_${{SLURM_ARRAY_TASK_ID}} -name "*.gz" -exec gunzip -f {{}} +\n'''
+            slurm_rfd3_code = f'''#!/bin/bash\n#SBATCH --job-name=rfd3_gen\n#SBATCH --output=logs/%x_%A_%a.out\n#SBATCH --error=logs/%x_%A_%a.err\n#SBATCH --ntasks=1\n#SBATCH --cpus-per-task=4\n#SBATCH --mem=32G\n#SBATCH --time=24:00:00\n#SBATCH --partition={partition}\n#SBATCH --gres=gpu:1\n#SBATCH --array=0-{array_limit}%8\n#SBATCH --export=NONE\n\nset -eo pipefail\n\nmkdir -p logs\neval "$(conda shell.bash hook)"\nconda activate rfdxcop\n\npython scripts/run_rfd3.py \\\n        --input_json "{input_json}" \\\n        --num_designs {num_designs} \\\n        --batch_size {batch_size} \\\n        --out_dir ./rfd3_outputs/batch_${{SLURM_ARRAY_TASK_ID}}\n\nfind ./rfd3_outputs/batch_${{SLURM_ARRAY_TASK_ID}} -name "*.gz" -exec gunzip -f {{}} +\n'''
             with open(os.path.join(base_dir, "scripts", "submit_rfd3.sh"), "w") as f: f.write(slurm_rfd3_code)
 
-        def _write_mpnn_scripts(self, base_dir, seqs_per_struct, array_limit, batch_ids=None):
+        def _write_mpnn_scripts(self, base_dir, seqs_per_struct, array_limit, batch_ids=None, *, partition="normal"):
             array_spec = (
                 ",".join(str(batch_id) for batch_id in batch_ids)
                 if batch_ids is not None else f"0-{array_limit}"
@@ -6806,10 +7020,10 @@ input_configs = [
 MPNNInferenceEngine(**engine_config).run(input_dicts=input_configs)
 '''
             with open(os.path.join(base_dir, "scripts", "run_mpnn.py"), "w") as f: f.write(run_mpnn_code)
-            slurm_mpnn_code = f'''#!/bin/bash\n#SBATCH --job-name=mpnn_seq\n#SBATCH --output=logs/%x_%A_%a.out\n#SBATCH --error=logs/%x_%A_%a.err\n#SBATCH --ntasks=1\n#SBATCH --cpus-per-task=2\n#SBATCH --mem=16G\n#SBATCH --time=04:00:00\n#SBATCH --partition=normal\n#SBATCH --gres=gpu:1\n#SBATCH --array={array_spec}%8\n#SBATCH --export=NONE\n\nset -eo pipefail\n\neval "$(conda shell.bash hook)"\nconda activate rfdxcop\n\nCURRENT_INPUT_DIR="./rfd3_outputs/batch_${{SLURM_ARRAY_TASK_ID}}"\nCURRENT_OUTPUT_DIR="./mpnn_outputs/batch_${{SLURM_ARRAY_TASK_ID}}"\nmkdir -p $CURRENT_OUTPUT_DIR\n\npython scripts/run_mpnn.py --input_dir $CURRENT_INPUT_DIR --out_dir $CURRENT_OUTPUT_DIR --seqs_per_struct {seqs_per_struct}\n\nsed -i "s/ \\[\\]$/ '[]'/g" $CURRENT_OUTPUT_DIR/*.cif\n'''
+            slurm_mpnn_code = f'''#!/bin/bash\n#SBATCH --job-name=mpnn_seq\n#SBATCH --output=logs/%x_%A_%a.out\n#SBATCH --error=logs/%x_%A_%a.err\n#SBATCH --ntasks=1\n#SBATCH --cpus-per-task=2\n#SBATCH --mem=16G\n#SBATCH --time=04:00:00\n#SBATCH --partition={partition}\n#SBATCH --gres=gpu:1\n#SBATCH --array={array_spec}%8\n#SBATCH --export=NONE\n\nset -eo pipefail\n\neval "$(conda shell.bash hook)"\nconda activate rfdxcop\n\nCURRENT_INPUT_DIR="./rfd3_outputs/batch_${{SLURM_ARRAY_TASK_ID}}"\nCURRENT_OUTPUT_DIR="./mpnn_outputs/batch_${{SLURM_ARRAY_TASK_ID}}"\nmkdir -p $CURRENT_OUTPUT_DIR\n\npython scripts/run_mpnn.py --input_dir $CURRENT_INPUT_DIR --out_dir $CURRENT_OUTPUT_DIR --seqs_per_struct {seqs_per_struct}\n\nsed -i "s/ \\[\\]$/ '[]'/g" $CURRENT_OUTPUT_DIR/*.cif\n'''
             with open(os.path.join(base_dir, "scripts", "submit_mpnn.sh"), "w") as f: f.write(slurm_mpnn_code)
 
-        def _write_rf3_scripts(self, base_dir, array_limit, batch_ids=None):
+        def _write_rf3_scripts(self, base_dir, array_limit, batch_ids=None, *, partition="normal"):
             array_spec = (
                 ",".join(str(batch_id) for batch_id in batch_ids)
                 if batch_ids is not None else f"0-{array_limit}"
@@ -6842,7 +7056,7 @@ RF3InferenceEngine(ckpt_path="rf3", verbose=False).run(
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
-#SBATCH --partition=normal
+#SBATCH --partition={partition}
 #SBATCH --gres=gpu:1
 #SBATCH --array={array_spec}%8
 #SBATCH --export=NONE
@@ -6862,7 +7076,7 @@ python scripts/run_rf3.py --input_dir $CURRENT_INPUT_DIR --out_dir $CURRENT_OUTP
             ) as f:
                 f.write(slurm_rf3_code)
 
-        def _write_validation_scripts(self, base_dir, array_limit, batch_ids=None):
+        def _write_validation_scripts(self, base_dir, array_limit, batch_ids=None, *, partition="cpu"):
             array_spec = (
                 ",".join(str(batch_id) for batch_id in batch_ids)
                 if batch_ids is not None else f"0-{array_limit}"
@@ -6993,7 +7207,7 @@ if results:
         w.writerows(results)
 '''
             with open(os.path.join(base_dir, "scripts", "run_validation.py"), "w") as f: f.write(run_val_code)
-            slurm_val_code = f'''#!/bin/bash\n#SBATCH --job-name=validate\n#SBATCH --output=logs/%x_%A_%a.out\n#SBATCH --error=logs/%x_%A_%a.err\n#SBATCH --ntasks=1\n#SBATCH --cpus-per-task=4\n#SBATCH --mem=8G\n#SBATCH --time=04:00:00\n#SBATCH --partition=cpu\n#SBATCH --array={array_spec}\n#SBATCH --export=NONE\n\nset -eo pipefail\n\neval "$(conda shell.bash hook)"\nconda activate rfdxcop\n\nmkdir -p ./scores\npython scripts/run_validation.py --rf3_dir ./rf3_outputs/batch_${{SLURM_ARRAY_TASK_ID}} --rfd3_base_dir ./rfd3_outputs --output_csv ./scores/scores_batch_${{SLURM_ARRAY_TASK_ID}}.csv\n'''
+            slurm_val_code = f'''#!/bin/bash\n#SBATCH --job-name=validate\n#SBATCH --output=logs/%x_%A_%a.out\n#SBATCH --error=logs/%x_%A_%a.err\n#SBATCH --ntasks=1\n#SBATCH --cpus-per-task=4\n#SBATCH --mem=8G\n#SBATCH --time=04:00:00\n#SBATCH --partition={partition}\n#SBATCH --array={array_spec}\n#SBATCH --export=NONE\n\nset -eo pipefail\n\neval "$(conda shell.bash hook)"\nconda activate rfdxcop\n\nmkdir -p ./scores\npython scripts/run_validation.py --rf3_dir ./rf3_outputs/batch_${{SLURM_ARRAY_TASK_ID}} --rfd3_base_dir ./rfd3_outputs --output_csv ./scores/scores_batch_${{SLURM_ARRAY_TASK_ID}}.csv\n'''
             with open(os.path.join(base_dir, "scripts", "submit_validation_cpu.sh"), "w") as f: f.write(slurm_val_code)
 
         def _write_consolidation_script(

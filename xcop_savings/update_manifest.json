@@ -10,7 +10,7 @@
         "software_versions"
       ],
       "executable": true,
-      "sha256": "d40526afacc411183f30e35f62d8760a2ae23e5dbfeff19d3124e412b4c21ad3"
+      "sha256": "d6c3afbe627f0dd9521d31972c834f809da984f4add5fa6e2902c79d77e455ec"
     },
     {
       "path": "xcop_savings/2d_class_planner.py",
@@ -38,7 +38,7 @@
       "preserve": [
         "shebang"
       ],
-      "sha256": "85d6de1cc73cede451c6d1110fffc00958ffcd4e262c3d4a7b5eb45f5fe056c6"
+      "sha256": "e15a85d703f7450540ae1cb2afb1fccef8a5fa63e12dd0d421c4c817036904de"
     },
     {
       "path": "xcop_savings/foldx.py",
@@ -102,7 +102,7 @@
       "preserve": [
         "shebang"
       ],
-      "sha256": "169dcdd1106e03cb202bada01a7feebb73616ee7434f7a16e4ff4bd0f4737cdf"
+      "sha256": "ad0f322d7186c0e0b218fb7befe4899243f64222a752a7619cbbce50bef6df9b"
     },
     {
       "path": "xcop_setup.py",
