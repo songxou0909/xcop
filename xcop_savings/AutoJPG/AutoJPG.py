@@ -18,9 +18,180 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QP
                              QPushButton, QLabel, QLineEdit, QComboBox, 
                              QTextEdit, QFileDialog, QMessageBox, QDialog,
                              QTabWidget, QListWidget, QListWidgetItem, QMenu,
-                             QAbstractItemView, QSplitter)
-from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt, QSize, QEvent
+                             QAbstractItemView, QSplitter, QGridLayout)
+from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt, QSize, QEvent, QProcess, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QIcon, QPainter, QPen, QColor
+
+# One-time Slurm partition selection (kept in this standalone script).
+def parse_partitions(output):
+    names = []
+    for line in output.splitlines():
+        name = line.strip().rstrip("*")
+        if name and not any(char.isspace() for char in name) and name not in names:
+            names.append(name)
+    return names
+
+
+def available_partitions():
+    result = subprocess.run(["sinfo", "--noheader", "--format=%P"],
+                            capture_output=True, text=True, timeout=5, check=True)
+    names = parse_partitions(result.stdout)
+    if not names:
+        raise ValueError("sinfo returned no partitions.")
+    return names
+
+
+class PartitionComboBox(QComboBox):
+    """A non-editable list with an arrow visible under each tool's theme."""
+    def __init__(self):
+        super().__init__()
+        self.setEditable(False)
+        self.setMaxVisibleItems(20)
+        self.setStyleSheet("""
+            QComboBox { padding-right: 28px; }
+            QComboBox::drop-down { width: 24px; border-left: 1px solid #555; }
+            QComboBox::down-arrow { image: none; }
+        """)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(self.palette().text().color(), 1.8))
+        painter.setOpacity(1.0 if self.isEnabled() else 0.5)
+        x, y = self.width() - 13, self.height() // 2
+        painter.drawLine(x - 4, y - 2, x, y + 2)
+        painter.drawLine(x, y + 2, x + 4, y - 2)
+
+
+class PartitionDialog(QDialog):
+    def __init__(self, defaults, parent=None, *, names=None, error="", action_label="Submit Job"):
+        super().__init__(parent)
+        self.setWindowTitle("Select Partition")
+        self.setMinimumWidth(390)
+        self.defaults = dict(defaults)
+        self.combos = {}
+        self.names = []
+        layout = QGridLayout(self)
+        for row, label in enumerate(defaults):
+            combo = PartitionComboBox()
+            combo.setPlaceholderText("Loading partitions...")
+            combo.setEnabled(False)
+            self.combos[label] = combo
+            layout.addWidget(QLabel(label + ":"), row, 0)
+            layout.addWidget(combo, row, 1, 1, 2)
+        row = len(defaults)
+        self.error_label = QLabel()
+        self.error_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.error_label.setWordWrap(True)
+        self.error_label.hide()
+        layout.addWidget(self.error_label, row, 0, 1, 3)
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.setAutoDefault(False)
+        self.submit_button = QPushButton(action_label)
+        self.submit_button.setDefault(True)
+        self.submit_button.setEnabled(False)
+        cancel = QPushButton("Cancel")
+        cancel.setAutoDefault(False)
+        layout.addWidget(self.refresh_button, row + 1, 0)
+        layout.addWidget(self.submit_button, row + 1, 1)
+        layout.addWidget(cancel, row + 1, 2)
+        layout.setColumnStretch(1, 1)
+        self.process = QProcess(self)
+        self.process.finished.connect(self.loaded)
+        self.process.errorOccurred.connect(self.failed)
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.process.kill)
+        self.refresh_button.clicked.connect(self.refresh)
+        self.submit_button.clicked.connect(self.accept)
+        cancel.clicked.connect(self.reject)
+        if names is None:
+            QTimer.singleShot(0, self.refresh)
+        else:
+            self.populate(names, error)
+
+    def populate(self, names, error=""):
+        self.names = list(names)
+        for label, combo in self.combos.items():
+            current = combo.currentText() or self.defaults[label]
+            combo.clear()
+            combo.addItems(names)
+            if current in names:
+                combo.setCurrentText(current)
+            combo.setEnabled(bool(names))
+            combo.setPlaceholderText("Partitions unavailable")
+        self.submit_button.setEnabled(bool(names))
+        self.error_label.setText(error)
+        self.error_label.setVisible(bool(error))
+        self.refresh_button.setText("Refresh")
+        self.refresh_button.setEnabled(True)
+
+    def refresh(self):
+        self.error_label.hide()
+        self.refresh_button.setEnabled(False)
+        self.refresh_button.setText("Loading...")
+        self.submit_button.setEnabled(False)
+        self.timer.start(5000)
+        self.process.start("sinfo", ["--noheader", "--format=%P"])
+
+    def failed(self, error):
+        self.timer.stop()
+        self.populate([], "Could not load partitions from sinfo. Click Refresh to retry.")
+
+    def loaded(self, code, status):
+        self.timer.stop()
+        output = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        names = parse_partitions(output)
+        if code or status != QProcess.ExitStatus.NormalExit or not names:
+            self.failed(None)
+        else:
+            self.populate(names)
+
+    def selections(self):
+        return {label: combo.currentText() for label, combo in self.combos.items()}
+
+    def done(self, result):
+        self.timer.stop()
+        if self.process.state() != QProcess.ProcessState.NotRunning:
+            self.process.kill()
+            self.process.waitForFinished(1000)
+        super().done(result)
+
+
+def resolve_partitions(defaults, parent=None, *, force=False, action_label="Submit Job"):
+    """Keep available defaults on left-click; otherwise ask, without saving choices."""
+    names, error = None, ""
+    if not force:
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            names = available_partitions()
+        except (OSError, subprocess.SubprocessError, ValueError):
+            names = []
+            error = "Could not load partitions from sinfo. Click Refresh to retry."
+        finally:
+            QApplication.restoreOverrideCursor()
+        if names and all(value in names for value in defaults.values()):
+            return dict(defaults)
+    dialog = PartitionDialog(defaults, parent, names=names, error=error, action_label=action_label)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return dialog.selections()
+
+
+def resolve_partition(default, parent=None, *, force=False, action_label="Submit Job"):
+    result = resolve_partitions({"Partition": default}, parent, force=force, action_label=action_label)
+    return None if result is None else result["Partition"]
+
+
+def bind_partition_menu(button, action, allowed=None):
+    button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+    button.customContextMenuRequested.connect(
+        lambda _pos: action() if button.isEnabled() and (allowed is None or allowed()) else None
+    )
+    tip = button.toolTip()
+    button.setToolTip((tip + "\n" if tip else "") + "Right-click to choose a partition for this run.")
+
 
 # --- PyTorch Core Functions ---
 def get_transforms():
@@ -996,6 +1167,8 @@ class ExecGUI(QWidget):
         self.run_btn = QPushButton("Execute Model")
         self.run_btn.setStyleSheet("background-color: #98c379; color: #1e1e1e; font-weight: bold; padding: 10px; border: 1px solid #98c379;")
         self.run_btn.clicked.connect(self.start_task)
+        bind_partition_menu(self.run_btn, lambda: self.start_task(force_partition=True),
+                            allowed=lambda: self.env_label.text() == "Slurm Cluster")
         main_layout.addWidget(self.run_btn)
 
         self.log_box = QTextEdit()
@@ -1239,7 +1412,13 @@ class ExecGUI(QWidget):
                     print(f"\n[Slurm] Error: {e}")
 
     # --- Execution Logic ---
-    def start_task(self):
+    def start_task(self, _checked=False, *, force_partition=False):
+        partition = None
+        if self.env_label.text() == "Slurm Cluster":
+            default = self.partition_combo.currentText().strip() or "gpu"
+            partition = resolve_partition(default, self, force=force_partition)
+            if partition is None:
+                return
         model_path = self.load_model_input.text().strip()
         target_dir = self.target_dir_input.text().strip()
         env = self.env_label.text()
@@ -1268,11 +1447,6 @@ class ExecGUI(QWidget):
             self.worker.start()
 
         elif env == "Slurm Cluster":
-            partition = self.partition_combo.currentText().strip()
-            if not partition:
-                QMessageBox.warning(self, "Warning", "Please specify a Slurm partition.")
-                self.run_btn.setEnabled(True)
-                return
             self.submit_to_slurm(target_dir, model_path, device_arg, partition, batch_size_val)
 
     def update_progress(self, val):
