@@ -3840,6 +3840,27 @@ def build_gain_submission(project_dir, output_path, partition, num_frames, relio
     ]
 
 
+class GainPartitionComboBox(QComboBox):
+    """Keep the dropdown indicator visible under the application's dark theme."""
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet("""
+            QComboBox { padding-right: 28px; }
+            QComboBox::drop-down { width: 24px; border-left: 1px solid #555; }
+            QComboBox::down-arrow { image: none; }
+        """)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(self.palette().text().color(), 1.8))
+        painter.setOpacity(1.0 if self.isEnabled() else 0.5)
+        x, y = self.width() - 13, self.height() // 2
+        painter.drawLine(x - 4, y - 2, x, y + 2)
+        painter.drawLine(x, y + 2, x + 4, y - 2)
+
+
 class GainFileDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3851,10 +3872,10 @@ class GainFileDialog(QDialog):
         self.submitted = False
         layout = QGridLayout(self)
 
-        self.partition_combo = QComboBox()
-        self.partition_combo.setEditable(True)
-        self.partition_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.partition_combo.lineEdit().setPlaceholderText("Select or type a partition")
+        self.partition_combo = GainPartitionComboBox()
+        self.partition_combo.setEditable(False)
+        self.partition_combo.setPlaceholderText("Loading partitions...")
+        self.partition_combo.setMaxVisibleItems(20)
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.setAutoDefault(False)
         layout.addWidget(QLabel("Partition:"), 0, 0)
@@ -3895,14 +3916,21 @@ class GainFileDialog(QDialog):
     def refresh_partitions(self):
         self.refresh_button.setEnabled(False)
         self.refresh_button.setText("Loading...")
+        self.partition_combo.setPlaceholderText("Loading partitions...")
+        self.partition_combo.setEnabled(bool(self.partitions))
+        self.submit_button.setEnabled(bool(self.partitions))
         self.partition_timer.start(5000)
-        self.partition_process.start("sinfo", ["--noheader", "--local", "--format=%P"])
+        self.partition_process.start("sinfo", ["--noheader", "--format=%P"])
 
     def partitions_failed(self, error):
         self.partition_timer.stop()
+        self.set_inputs_enabled(not self.submitting and not self.submitted)
         self.refresh_button.setEnabled(not self.submitting and not self.submitted)
         self.refresh_button.setText("Refresh")
-        self.partition_combo.setToolTip("Could not load Slurm partitions. Type a partition name or refresh.")
+        self.partition_combo.setPlaceholderText("Partitions unavailable")
+        error_text = bytes(self.partition_process.readAllStandardError()).decode("utf-8", errors="replace").strip()
+        self.set_status("Error: Could not load Slurm partitions from sinfo. Click Refresh to retry."
+                        + (f"\n{error_text}" if error_text else ""))
 
     def partitions_finished(self, exit_code, exit_status):
         self.partition_timer.stop()
@@ -3915,18 +3943,16 @@ class GainFileDialog(QDialog):
             self.partitions_failed(None)
             return
         self.partitions = partitions
-        # A slow discovery must not replace a manually entered partition.
         self.populate_partitions(preserve_selection=True)
-        self.refresh_button.setEnabled(not self.submitting and not self.submitted)
+        self.set_inputs_enabled(not self.submitting and not self.submitted)
         self.refresh_button.setText("Refresh")
-        self.partition_combo.setToolTip("")
 
     def populate_partitions(self, preserve_selection=False):
         current = self.partition_combo.currentText().strip() if preserve_selection else ""
         self.partition_combo.clear()
         self.partition_combo.addItems(self.partitions)
         default = "cpu" if "cpu" in self.partitions else (self.partitions[0] if self.partitions else "")
-        self.partition_combo.setCurrentText(current or default)
+        self.partition_combo.setCurrentText(current if current in self.partitions else default)
 
     def browse_output(self):
         file_path, _ = QFileDialog.getSaveFileName(
@@ -3943,9 +3969,10 @@ class GainFileDialog(QDialog):
             app.output_text.setPlainText(message)
 
     def set_inputs_enabled(self, enabled):
-        for widget in (self.partition_combo, self.output_entry,
-                       self.browse_button, self.submit_button):
+        for widget in (self.output_entry, self.browse_button):
             widget.setEnabled(enabled)
+        self.partition_combo.setEnabled(enabled and bool(self.partitions))
+        self.submit_button.setEnabled(enabled and bool(self.partitions))
         self.refresh_button.setEnabled(enabled and self.partition_process.state() == QProcess.ProcessState.NotRunning)
         self.cancel_button.setEnabled(not self.submitting)
 
@@ -3954,8 +3981,8 @@ class GainFileDialog(QDialog):
             return
         partition = self.partition_combo.currentText().strip()
         output = self.output_entry.text().strip()
-        if not partition or any(char.isspace() for char in partition):
-            self.set_status("Error: Select or type a valid Slurm partition name.")
+        if partition not in self.partitions:
+            self.set_status("Error: Select a Slurm partition from the dropdown list.")
             return
         if not output:
             self.set_status("Error: Choose an output file.")
