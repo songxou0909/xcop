@@ -144,6 +144,7 @@ if __name__ == "__main__":
 import os
 import json
 import re
+import shlex
 from datetime import datetime
 import subprocess
 import threading
@@ -159,8 +160,8 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QLabel, QLineEdit,
                              QPushButton, QComboBox, QTextEdit, QMessageBox, QFileDialog, 
                              QGridLayout, QVBoxLayout, QHBoxLayout, QSizePolicy,
                              QSplitter, QListWidget, QStyle,
-                             QProxyStyle, QCheckBox, QFrame)
-from PyQt6.QtCore import QTimer, QObject, QEvent, pyqtSignal
+                             QProxyStyle, QCheckBox, QFrame, QDialog)
+from PyQt6.QtCore import QTimer, QObject, QEvent, pyqtSignal, QProcess
 from PyQt6.QtGui import QTextCursor, QTextCharFormat
 
 if __name__ == "__main__":
@@ -3807,68 +3808,244 @@ def get_movie_frames():
         if 'app' in globals() and app:
             app.output_text.setText(f"Crash: {str(e)}")
 
-def open_new_gain_file():
-    # 1. Ask user where to save the file
-    current_dir = os.getcwd()
-    file_path, _ = QFileDialog.getSaveFileName(
-        None, 
-        "Save New Gain File", 
-        os.path.join(current_dir, "Gain_relion_estimated.mrc"), 
-        "MRC files (*.mrc);;All files (*.*)"
-    )
+def parse_gain_partitions(output):
+    """Collect unique partition names from sinfo %P, removing the default marker."""
+    partitions = []
+    for line in output.splitlines():
+        name = line.strip().rstrip("*")
+        if not name or any(char.isspace() for char in name):
+            continue
+        if name not in partitions:
+            partitions.append(name)
+    return partitions
 
-    if not file_path:
-        return
 
-    # 2. Calculate the relative path from current working directory
-    # If the user selected a file inside the current project folder, this makes it relative.
-    # If it's outside, relpath handles that too (though usually less clean).
-    try:
-        relative_path = os.path.relpath(file_path, current_dir)
-    except ValueError:
-        # Fallback for Windows if drives are different
-        relative_path = file_path
+def build_gain_submission(project_dir, output_path, partition, num_frames, relion_module):
+    """Return sbatch argv; the calculation stays in the foreground of the batch job."""
+    commands = [f"cd -- {shlex.quote(project_dir)}"]
+    if relion_module.strip():
+        commands.append(f"module load {shlex.quote(relion_module.strip())}")
+    commands.append("exec " + shlex.join([
+        "srun", "--ntasks=1", "--cpus-per-task=10", "relion_estimate_gain",
+        "--i", "Import/job001/movies.star", "--o", output_path,
+        "--dont_invert", "--max_frames", str(num_frames * 1000),
+    ]))
+    # --wrap uses /bin/sh. A login Bash initializes the cluster's module command.
+    wrapped_command = "exec " + shlex.join(["/bin/bash", "-lc", " && ".join(commands)])
+    return [
+        "sbatch", "--parsable", "--job-name=xcop_gain", "--nodes=1",
+        "--ntasks=1", "--cpus-per-task=10", f"--partition={partition}",
+        f"--chdir={project_dir}", "--output=xcop_gain_%j.out",
+        "--error=xcop_gain_%j.err", "--wrap", wrapped_command,
+    ]
 
-    # 3. Get frame count (Reusing existing logic)
-    # We must ensure we have a valid EER file to check frames
-    eer_file = get_first_eer_file()
-    
-    if not eer_file:
-        if 'app' in globals() and app:
-            app.output_text.setText("Error: No .eer file found in ./Movies to calculate frames.")
-        return
 
-    frames_str = get_number_of_frames(eer_file)
-    
-    if not frames_str:
-        if 'app' in globals() and app:
-            app.output_text.setText("Error: Could not read frame count from EER file.")
-        return
+class GainFileDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("New Gain File")
+        self.resize(490, 120)
+        self.project_dir = os.getcwd()
+        self.partitions = []
+        self.submitting = False
+        self.submitted = False
+        layout = QGridLayout(self)
 
-    try:
-        # 4. Calculate max frames (frames * 1000)
-        num_frames = int(frames_str)
-        max_frames_val = num_frames * 1000
-        
-        # 5. Construct Command
-        command = (
-            f"module load {RELION_VER} && srun -c 10 -p cpu relion_estimate_gain "
-            f"--i Import/job001/movies.star "
-            f"--o {relative_path} "
-            f"--dont_invert --max_frames {max_frames_val} &"
+        self.partition_combo = QComboBox()
+        self.partition_combo.setEditable(True)
+        self.partition_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.partition_combo.lineEdit().setPlaceholderText("Select or type a partition")
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.setAutoDefault(False)
+        layout.addWidget(QLabel("Partition:"), 0, 0)
+        layout.addWidget(self.partition_combo, 0, 1)
+        layout.addWidget(self.refresh_button, 0, 2)
+
+        self.output_entry = QLineEdit("gain_reference_estimated.mrc")
+        self.browse_button = QPushButton("Browse...")
+        self.browse_button.setAutoDefault(False)
+        layout.addWidget(QLabel("Output file:"), 1, 0)
+        layout.addWidget(self.output_entry, 1, 1)
+        layout.addWidget(self.browse_button, 1, 2)
+
+        self.submit_button = QPushButton("Submit Job")
+        self.submit_button.setDefault(True)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setAutoDefault(False)
+        layout.addWidget(self.submit_button, 2, 1)
+        layout.addWidget(self.cancel_button, 2, 2)
+        layout.setColumnStretch(1, 1)
+
+        self.partition_process = QProcess(self)
+        self.partition_process.finished.connect(self.partitions_finished)
+        self.partition_process.errorOccurred.connect(self.partitions_failed)
+        self.partition_timer = QTimer(self)
+        self.partition_timer.setSingleShot(True)
+        self.partition_timer.timeout.connect(self.partition_process.kill)
+        self.submit_process = QProcess(self)
+        self.submit_process.finished.connect(self.submission_finished)
+        self.submit_process.errorOccurred.connect(self.submission_failed)
+
+        self.refresh_button.clicked.connect(self.refresh_partitions)
+        self.browse_button.clicked.connect(self.browse_output)
+        self.submit_button.clicked.connect(self.submit_job)
+        self.cancel_button.clicked.connect(self.reject)
+        self.refresh_partitions()
+
+    def refresh_partitions(self):
+        self.refresh_button.setEnabled(False)
+        self.refresh_button.setText("Loading...")
+        self.partition_timer.start(5000)
+        self.partition_process.start("sinfo", ["--noheader", "--local", "--format=%P"])
+
+    def partitions_failed(self, error):
+        self.partition_timer.stop()
+        self.refresh_button.setEnabled(not self.submitting and not self.submitted)
+        self.refresh_button.setText("Refresh")
+        self.partition_combo.setToolTip("Could not load Slurm partitions. Type a partition name or refresh.")
+
+    def partitions_finished(self, exit_code, exit_status):
+        self.partition_timer.stop()
+        output = bytes(self.partition_process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        if exit_code != 0 or exit_status != QProcess.ExitStatus.NormalExit:
+            self.partitions_failed(None)
+            return
+        partitions = parse_gain_partitions(output)
+        if not partitions:
+            self.partitions_failed(None)
+            return
+        self.partitions = partitions
+        # A slow discovery must not replace a manually entered partition.
+        self.populate_partitions(preserve_selection=True)
+        self.refresh_button.setEnabled(not self.submitting and not self.submitted)
+        self.refresh_button.setText("Refresh")
+        self.partition_combo.setToolTip("")
+
+    def populate_partitions(self, preserve_selection=False):
+        current = self.partition_combo.currentText().strip() if preserve_selection else ""
+        self.partition_combo.clear()
+        self.partition_combo.addItems(self.partitions)
+        default = "cpu" if "cpu" in self.partitions else (self.partitions[0] if self.partitions else "")
+        self.partition_combo.setCurrentText(current or default)
+
+    def browse_output(self):
+        file_path, _ = QFileDialog.getSaveFileName(
+            None, "Save New Gain File",
+            os.path.join(self.project_dir, self.output_entry.text().strip() or "gain_reference_estimated.mrc"),
+            "MRC files (*.mrc);;All files (*.*)",
+            options=QFileDialog.Option.DontConfirmOverwrite,
         )
-        
-        write_to_log(command)
+        if file_path:
+            self.output_entry.setText(file_path)
 
-        # 6. Execute
-        subprocess.Popen(command, shell=True, executable="/bin/bash")
-        
+    def set_status(self, message):
         if 'app' in globals() and app:
-            app.output_text.setText(f"Command Sent\n\nRunning...\n\nDetected Frames:{num_frames}\nPlease wait for Relion...")
-            
-    except ValueError:
-        if 'app' in globals() and app:
-            app.output_text.setText(f"Error: Invalid frame count detected ({frames_str}).")
+            app.output_text.setPlainText(message)
+
+    def set_inputs_enabled(self, enabled):
+        for widget in (self.partition_combo, self.output_entry,
+                       self.browse_button, self.submit_button):
+            widget.setEnabled(enabled)
+        self.refresh_button.setEnabled(enabled and self.partition_process.state() == QProcess.ProcessState.NotRunning)
+        self.cancel_button.setEnabled(not self.submitting)
+
+    def submit_job(self):
+        if self.submitting or self.submitted:
+            return
+        partition = self.partition_combo.currentText().strip()
+        output = self.output_entry.text().strip()
+        if not partition or any(char.isspace() for char in partition):
+            self.set_status("Error: Select or type a valid Slurm partition name.")
+            return
+        if not output:
+            self.set_status("Error: Choose an output file.")
+            return
+        output_path = os.path.abspath(os.path.join(self.project_dir, output))
+        if os.path.isdir(output_path) or not os.path.isdir(os.path.dirname(output_path)):
+            self.set_status("Error: Choose an output file in an existing directory.")
+            return
+        if not os.path.isfile(os.path.join(self.project_dir, "Import", "job001", "movies.star")):
+            self.set_status("Error: Import/job001/movies.star was not found in the RELION project directory.")
+            return
+        movies_dir = os.path.join(self.project_dir, "Movies")
+        eer_file = get_first_eer_file(movies_dir)
+        if not eer_file:
+            self.set_status("Error: No .eer file found in ./Movies to calculate frames.")
+            return
+        frames_str = get_number_of_frames(eer_file, movies_dir)
+        try:
+            num_frames = int(frames_str)
+            if num_frames <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            self.set_status("Error: Could not read a valid frame count from the EER file.")
+            return
+        if os.path.exists(output_path):
+            answer = QMessageBox.question(
+                self, "Replace Gain File?", f"The file already exists:\n{output_path}\n\nReplace it when the job runs?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        command = build_gain_submission(self.project_dir, output_path, partition, num_frames, RELION_VER)
+        self.submission_details = (partition, output_path, num_frames)
+        write_to_log(shlex.join(command))
+        self.submitting = True
+        self.set_inputs_enabled(False)
+        self.set_status("Submitting to Slurm... Wait for the job ID before closing the terminal.")
+        self.submit_process.setWorkingDirectory(self.project_dir)
+        self.submit_process.start(command[0], command[1:])
+
+    def submission_failed(self, error):
+        if error == QProcess.ProcessError.FailedToStart:
+            self.submitting = False
+            self.set_inputs_enabled(True)
+            self.set_status("Error: Could not start sbatch. Run xcop on a Slurm login node.\n" + self.submit_process.errorString())
+        # A crash also emits finished; handle it there so output is read only once.
+
+    def submission_finished(self, exit_code, exit_status):
+        self.submitting = False
+        output = bytes(self.submit_process.readAllStandardOutput()).decode("utf-8", errors="replace").strip()
+        error = bytes(self.submit_process.readAllStandardError()).decode("utf-8", errors="replace").strip()
+        if exit_code != 0 or exit_status != QProcess.ExitStatus.NormalExit:
+            self.set_inputs_enabled(True)
+            self.set_status(f"Error: Slurm submission failed.\n{error or output or self.submit_process.errorString()}")
+            return
+
+        self.submitted = True
+        self.set_inputs_enabled(False)
+        self.cancel_button.setText("Close")
+        match = re.fullmatch(r"(\d+)(?:;[^;\s]+)?", output)
+        if not match:
+            self.set_status(f"Slurm accepted the submission, but no job ID could be read.\nCheck Queue before submitting again.\n{output}\n{error}")
+            return
+        job_id = match.group(1)
+        partition, output_path, num_frames = self.submission_details
+        message = (
+            f"Submitted Slurm job {output}. You can now close the terminal.\n\n"
+            f"Partition: {partition} | CPUs: 10\n"
+            f"Detected frames: {num_frames} | Max frames: {num_frames * 1000}\n"
+            f"Output: {output_path}\n"
+            f"Log: {os.path.join(self.project_dir, 'xcop_gain_' + job_id + '.out')}\n"
+            f"Errors: {os.path.join(self.project_dir, 'xcop_gain_' + job_id + '.err')}"
+        )
+        if error:
+            message += f"\nSlurm message: {error}"
+        write_to_log(message)
+        self.set_status(message)
+        self.accept()
+
+    def reject(self):
+        if not self.submitting:
+            super().reject()
+
+
+def open_new_gain_file():
+    window = GainFileDialog(globals().get('app'))
+    toplevel_windows.append(window)
+    window.show()
 
 # ====================== Multi-layer Chain Modifier ======================
 def open_chain_modifier():
