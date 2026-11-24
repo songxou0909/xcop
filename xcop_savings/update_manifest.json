@@ -10,7 +10,7 @@
         "software_versions"
       ],
       "executable": true,
-      "sha256": "32331fdb4dd6cd27d5afe13a6a15f01bf19d00e1a87e63365004bfc3d3445215"
+      "sha256": "d40526afacc411183f30e35f62d8760a2ae23e5dbfeff19d3124e412b4c21ad3"
     },
     {
       "path": "xcop_savings/2d_class_planner.py",
