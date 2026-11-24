@@ -163,6 +163,251 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QLabel, QLineEdit,
                              QProxyStyle, QCheckBox, QFrame, QDialog)
 from PyQt6.QtCore import QTimer, QObject, QEvent, pyqtSignal, QProcess
 from PyQt6.QtGui import QTextCursor, QTextCharFormat
+# One-time Slurm partition selection (kept in this standalone script).
+def parse_partitions(output):
+    names = []
+    for line in output.splitlines():
+        name = line.strip().rstrip("*")
+        if name and not any(char.isspace() for char in name) and name not in names:
+            names.append(name)
+    return names
+
+
+def available_partitions():
+    result = subprocess.run(["sinfo", "--noheader", "--format=%P"],
+                            capture_output=True, text=True, timeout=5, check=True)
+    names = parse_partitions(result.stdout)
+    if not names:
+        raise ValueError("sinfo returned no partitions.")
+    return names
+
+
+class PartitionComboBox(QComboBox):
+    """A non-editable list with an arrow visible under each tool's theme."""
+    def __init__(self):
+        super().__init__()
+        self.setEditable(False)
+        self.setMaxVisibleItems(20)
+        self.setStyleSheet("""
+            QComboBox { padding-right: 28px; }
+            QComboBox::drop-down { width: 24px; border-left: 1px solid #555; }
+            QComboBox::down-arrow { image: none; }
+        """)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(self.palette().text().color(), 1.8))
+        painter.setOpacity(1.0 if self.isEnabled() else 0.5)
+        x, y = self.width() - 13, self.height() // 2
+        painter.drawLine(x - 4, y - 2, x, y + 2)
+        painter.drawLine(x, y + 2, x + 4, y - 2)
+
+
+class PartitionDialog(QDialog):
+    def __init__(self, defaults, parent=None, *, names=None, error="", action_label="Submit Job"):
+        super().__init__(parent)
+        self.setWindowTitle("Select Partition")
+        self.setMinimumWidth(390)
+        self.defaults = dict(defaults)
+        self.combos = {}
+        self.names = []
+        layout = QGridLayout(self)
+        for row, label in enumerate(defaults):
+            combo = PartitionComboBox()
+            combo.setPlaceholderText("Loading partitions...")
+            combo.setEnabled(False)
+            self.combos[label] = combo
+            layout.addWidget(QLabel(label + ":"), row, 0)
+            layout.addWidget(combo, row, 1, 1, 2)
+        row = len(defaults)
+        self.error_label = QLabel()
+        self.error_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.error_label.setWordWrap(True)
+        self.error_label.hide()
+        layout.addWidget(self.error_label, row, 0, 1, 3)
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.setAutoDefault(False)
+        self.submit_button = QPushButton(action_label)
+        self.submit_button.setDefault(True)
+        self.submit_button.setEnabled(False)
+        cancel = QPushButton("Cancel")
+        cancel.setAutoDefault(False)
+        layout.addWidget(self.refresh_button, row + 1, 0)
+        layout.addWidget(self.submit_button, row + 1, 1)
+        layout.addWidget(cancel, row + 1, 2)
+        layout.setColumnStretch(1, 1)
+        self.process = QProcess(self)
+        self.process.finished.connect(self.loaded)
+        self.process.errorOccurred.connect(self.failed)
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.process.kill)
+        self.refresh_button.clicked.connect(self.refresh)
+        self.submit_button.clicked.connect(self.accept)
+        cancel.clicked.connect(self.reject)
+        if names is None:
+            QTimer.singleShot(0, self.refresh)
+        else:
+            self.populate(names, error)
+
+    def populate(self, names, error=""):
+        self.names = list(names)
+        for label, combo in self.combos.items():
+            current = combo.currentText() or self.defaults[label]
+            combo.clear()
+            combo.addItems(names)
+            if current in names:
+                combo.setCurrentText(current)
+            combo.setEnabled(bool(names))
+            combo.setPlaceholderText("Partitions unavailable")
+        self.submit_button.setEnabled(bool(names))
+        self.error_label.setText(error)
+        self.error_label.setVisible(bool(error))
+        self.refresh_button.setText("Refresh")
+        self.refresh_button.setEnabled(True)
+
+    def refresh(self):
+        self.error_label.hide()
+        self.refresh_button.setEnabled(False)
+        self.refresh_button.setText("Loading...")
+        self.submit_button.setEnabled(False)
+        self.timer.start(5000)
+        self.process.start("sinfo", ["--noheader", "--format=%P"])
+
+    def failed(self, error):
+        self.timer.stop()
+        self.populate([], "Could not load partitions from sinfo. Click Refresh to retry.")
+
+    def loaded(self, code, status):
+        self.timer.stop()
+        output = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        names = parse_partitions(output)
+        if code or status != QProcess.ExitStatus.NormalExit or not names:
+            self.failed(None)
+        else:
+            self.populate(names)
+
+    def selections(self):
+        return {label: combo.currentText() for label, combo in self.combos.items()}
+
+    def done(self, result):
+        self.timer.stop()
+        if self.process.state() != QProcess.ProcessState.NotRunning:
+            self.process.kill()
+            self.process.waitForFinished(1000)
+        super().done(result)
+
+
+def resolve_partitions(defaults, parent=None, *, force=False, action_label="Submit Job"):
+    """Keep available defaults on left-click; otherwise ask, without saving choices."""
+    names, error = None, ""
+    if not force:
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            names = available_partitions()
+        except (OSError, subprocess.SubprocessError, ValueError):
+            names = []
+            error = "Could not load partitions from sinfo. Click Refresh to retry."
+        finally:
+            QApplication.restoreOverrideCursor()
+        if names and all(value in names for value in defaults.values()):
+            return dict(defaults)
+    dialog = PartitionDialog(defaults, parent, names=names, error=error, action_label=action_label)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return dialog.selections()
+
+
+def resolve_partition(default, parent=None, *, force=False, action_label="Submit Job"):
+    result = resolve_partitions({"Partition": default}, parent, force=force, action_label=action_label)
+    return None if result is None else result["Partition"]
+
+
+def bind_partition_menu(button, action, allowed=None):
+    button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+    button.customContextMenuRequested.connect(
+        lambda _pos: action() if button.isEnabled() and (allowed is None or allowed()) else None
+    )
+    tip = button.toolTip()
+    button.setToolTip((tip + "\n" if tip else "") + "Right-click to choose a partition for this run.")
+
+
+# Keep original shell text intact when changing partition options in main-window
+# commands. Only inspect Slurm's leading options, never the application's flags.
+_SHELL_TOKEN = re.compile(r'''(?:[^\s;&|<>()'"\\]|\\.|'[^']*'|"(?:\\.|[^"\\])*")+|[;&|<>()]+|\n''')
+_VALUE_OPTIONS = {"-c", "-n", "-N", "-w", "-x", "-J", "-D", "-A", "-t", "-o", "-e",
+                  "--cpus-per-task", "--ntasks", "--nodes", "--nodelist", "--exclude",
+                  "--job-name", "--chdir", "--account", "--time", "--output", "--error",
+                  "--gres", "--gpus", "--mem", "--qos", "--constraint", "--dependency"}
+
+
+def command_partition_spans(command):
+    tokens = list(_SHELL_TOKEN.finditer(command))
+    found = []
+    index = 0
+    command_start = True
+    while index < len(tokens):
+        token = tokens[index]
+        raw = token.group()
+        if raw in {"&&", "||", ";", "&", "|", "\n", "(", ")"}:
+            command_start = True
+            index += 1
+            continue
+        if not command_start:
+            index += 1
+            continue
+        if raw in {"exec", "command"} or re.match(r"[A-Za-z_][A-Za-z_0-9]*=", raw):
+            index += 1
+            continue
+        command_start = False
+        if raw not in {"srun", "sbatch", "salloc"}:
+            index += 1
+            continue
+        index += 1
+        while index < len(tokens):
+            token = tokens[index]
+            try:
+                value = shlex.split(token.group())[0]
+            except (ValueError, IndexError):
+                break
+            if value in {"-p", "--partition"} and index + 1 < len(tokens):
+                name_token = tokens[index + 1]
+                try:
+                    name = shlex.split(name_token.group())[0]
+                except (ValueError, IndexError):
+                    break
+                found.append((name_token.start(), name_token.end(), name, ""))
+                index += 2
+            elif value.startswith("--partition="):
+                found.append((token.start(), token.end(), value.split("=", 1)[1], "--partition="))
+                index += 1
+            elif value in _VALUE_OPTIONS:
+                index += 2
+            elif value.startswith("-"):
+                index += 1
+            else:
+                break
+    return found
+
+
+def resolve_command_partitions(command, parent=None, *, force=False):
+    spans = command_partition_spans(command)
+    if not spans:
+        return None if force else command
+    names = list(dict.fromkeys(span[2] for span in spans))
+    labels = {name: ("Partition" if len(names) == 1 else f"Partition ({name})") for name in names}
+    chosen = resolve_partitions({labels[name]: name for name in names}, parent, force=force)
+    if chosen is None:
+        return None
+    for start, end, original, prefix in reversed(spans):
+        command = command[:start] + prefix + shlex.quote(chosen[labels[original]]) + command[end:]
+    return command
+
+parse_gain_partitions = parse_partitions
+GainPartitionComboBox = PartitionComboBox
+
 
 if __name__ == "__main__":
     splash.showMessage("   Loading NumPy...", Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft, QColor("#d4d4d4"))
@@ -737,19 +982,20 @@ def get_pixel_size_value(pixel_size_tuple, label="Pixel Size"):
     return combo.currentText()
 
 # Function to execute command in cluster
-def execute_command(command, run_button):
+def execute_command(command, run_button, *, force_partition=False):
     if not command:
         show_error_message("No command entered.")
         run_button.setEnabled(True)
         return
 
-    write_to_log(command)
     run_button.setEnabled(False)
-
-    if 'app' in globals() and app:
-        app.output_text.setText(f"Command Sent\n\n{app.output_text.toPlainText()}")
-    
     try:
+        command = resolve_command_partitions(command, globals().get('app'), force=force_partition)
+        if command is None:
+            return
+        write_to_log(command)
+        if 'app' in globals() and app:
+            app.output_text.setPlainText(f"Command Sent\n\n{command}")
         subprocess.Popen(command, shell=True, executable="/bin/bash")
     except Exception as e:
         show_error_message(f"Error executing command: {str(e)}")
@@ -1080,6 +1326,9 @@ class App(QMainWindow):
         # Remove threading.Thread. Call the function directly.
         self.run_button.clicked.connect(lambda: execute_command(
             self.output_text.toPlainText().strip(), self.run_button
+        ))
+        bind_partition_menu(self.run_button, lambda: execute_command(
+            self.output_text.toPlainText().strip(), self.run_button, force_partition=True
         ))
         
         self.clean_button = QPushButton("Clean")
@@ -2232,7 +2481,7 @@ def open_input_window_building():
                 build_custom_model_entry.setText(model_name)
     QTimer.singleShot(50, build_set_saved_model)
 
-    def get_build_command():
+    def get_build_command(partition="cpu"):
         global last_inputs
         params = [""] * len(labels_build)
         for i, entry in enumerate(entries_build):
@@ -2284,7 +2533,7 @@ def open_input_window_building():
             return None, "Number of Classes and Run Number must be integers."
 
         base_sentence = (
-            f"module load {RELION_VER} && srun -p cpu -c {cpu_count} relion_helix_inimodel2d "
+            f"module load {RELION_VER} && srun -p {shlex.quote(partition)} -c {cpu_count} relion_helix_inimodel2d "
             f"--i Select/job{params[1]}/class_averages.star "
             f"--o {params[4]}/{params[2]}/run{params[3]} --angpix {params[5]} "
             f"--mask_diameter {params[6]} --search_angle {params[9]} --step_angle {params[10]} "
@@ -2304,8 +2553,11 @@ def open_input_window_building():
             
         return sentence, None
 
-    def submit_build():
-        sentence, err = get_build_command()
+    def submit_build(*, force_partition=False):
+        partition = resolve_partition("cpu", input_window, force=force_partition, action_label="Generate Command")
+        if partition is None:
+            return
+        sentence, err = get_build_command(partition)
         if err:
             show_error_message(err)
             return
@@ -2329,9 +2581,11 @@ def open_input_window_building():
                 entry.setEnabled(not disable)
                 entry.setStyleSheet(disabled_style if disable else normal_style)
         
-    def execute_build():
+    def execute_build(*, force_partition=False):
         # Check if we are in "Cancel" mode
         if hasattr(btn_build_execute, 'process') and btn_build_execute.process is not None:
+            if force_partition:
+                return
             try:
                 import os, signal, time
                 pgid = os.getpgid(btn_build_execute.process.pid)
@@ -2359,10 +2613,13 @@ def open_input_window_building():
             return
 
         # Regular "Execute" mode
+        partition = resolve_partition("cpu", input_window, force=force_partition)
+        if partition is None:
+            return
         spi_canvas.iteration_count = 0
         spi_canvas.last_mtime = 0
 
-        sentence, err = get_build_command()
+        sentence, err = get_build_command(partition)
         if err:
             show_error_message(err)
             return
@@ -2425,11 +2682,14 @@ def open_input_window_building():
 
     build_btn_layout = QHBoxLayout()
     btn_build_submit = QPushButton("Submit")
-    btn_build_submit.clicked.connect(submit_build)
+    btn_build_submit.clicked.connect(lambda: submit_build())
+    bind_partition_menu(btn_build_submit, lambda: submit_build(force_partition=True))
     btn_build_execute = QPushButton("Execute")
     btn_build_execute.setStyleSheet("background-color: #98c379; color: #1e1e1e; font-weight: bold;")
     btn_build_execute.process = None  # Track the running process here
-    btn_build_execute.clicked.connect(execute_build)
+    btn_build_execute.clicked.connect(lambda: execute_build())
+    bind_partition_menu(btn_build_execute, lambda: execute_build(force_partition=True),
+                        allowed=lambda: btn_build_execute.process is None)
     build_btn_layout.addWidget(btn_build_submit)
     build_btn_layout.addWidget(btn_build_execute)
     left_layout.addLayout(build_btn_layout, len(labels_build), 0, 1, 3)
@@ -3808,18 +4068,6 @@ def get_movie_frames():
         if 'app' in globals() and app:
             app.output_text.setText(f"Crash: {str(e)}")
 
-def parse_gain_partitions(output):
-    """Collect unique partition names from sinfo %P, removing the default marker."""
-    partitions = []
-    for line in output.splitlines():
-        name = line.strip().rstrip("*")
-        if not name or any(char.isspace() for char in name):
-            continue
-        if name not in partitions:
-            partitions.append(name)
-    return partitions
-
-
 def build_gain_submission(project_dir, output_path, partition, num_frames, relion_module):
     """Return sbatch argv; the calculation stays in the foreground of the batch job."""
     commands = [f"cd -- {shlex.quote(project_dir)}"]
@@ -3838,27 +4086,6 @@ def build_gain_submission(project_dir, output_path, partition, num_frames, relio
         f"--chdir={project_dir}", "--output=xcop_gain_%j.out",
         "--error=xcop_gain_%j.err", "--wrap", wrapped_command,
     ]
-
-
-class GainPartitionComboBox(QComboBox):
-    """Keep the dropdown indicator visible under the application's dark theme."""
-    def __init__(self):
-        super().__init__()
-        self.setStyleSheet("""
-            QComboBox { padding-right: 28px; }
-            QComboBox::drop-down { width: 24px; border-left: 1px solid #555; }
-            QComboBox::down-arrow { image: none; }
-        """)
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(self.palette().text().color(), 1.8))
-        painter.setOpacity(1.0 if self.isEnabled() else 0.5)
-        x, y = self.width() - 13, self.height() // 2
-        painter.drawLine(x - 4, y - 2, x, y + 2)
-        painter.drawLine(x, y + 2, x + 4, y - 2)
 
 
 class GainFileDialog(QDialog):
@@ -3910,6 +4137,7 @@ class GainFileDialog(QDialog):
         self.refresh_button.clicked.connect(self.refresh_partitions)
         self.browse_button.clicked.connect(self.browse_output)
         self.submit_button.clicked.connect(self.submit_job)
+        bind_partition_menu(self.submit_button, lambda: self.submit_job(force_partition=True))
         self.cancel_button.clicked.connect(self.reject)
         self.refresh_partitions()
 
@@ -3976,13 +4204,16 @@ class GainFileDialog(QDialog):
         self.refresh_button.setEnabled(enabled and self.partition_process.state() == QProcess.ProcessState.NotRunning)
         self.cancel_button.setEnabled(not self.submitting)
 
-    def submit_job(self):
+    def submit_job(self, _checked=False, *, force_partition=False):
         if self.submitting or self.submitted:
             return
         partition = self.partition_combo.currentText().strip()
         output = self.output_entry.text().strip()
         if partition not in self.partitions:
             self.set_status("Error: Select a Slurm partition from the dropdown list.")
+            return
+        partition = resolve_partition(partition, self, force=force_partition)
+        if partition is None:
             return
         if not output:
             self.set_status("Error: Choose an output file.")
@@ -4404,7 +4635,13 @@ def open_input_window_symmetry():
     QTimer.singleShot(50, set_saved_model)
 
     # === Main Logic ===
-    def submit_inputs(button_type):
+    def submit_inputs(button_type, *, force_partition=False):
+        partition = None
+        if button_type == "ExpandMap":
+            partition = resolve_partition("normal", input_window, force=force_partition,
+                                          action_label="Generate Command")
+            if partition is None:
+                return
         global last_symmetry_inputs
         params = []
         
@@ -4632,9 +4869,9 @@ def open_input_window_symmetry():
             large_map = os.path.join(rel_out_dir, large_map_filename).replace("\\", "/")
             expanded_map = os.path.join(rel_out_dir, expanded_map_filename).replace("\\", "/")
 
-            sentence = (f"module load {RELION_VER} && srun -c 100 -p normal relion_image_handler --i {input_mrc} --new_box {new_box_size} "
+            sentence = (f"module load {RELION_VER} && srun -c 100 -p {shlex.quote(partition)} relion_image_handler --i {input_mrc} --new_box {new_box_size} "
                         f"--o {large_map} --lowpass 2 && "
-                        f"srun -c 100 -p normal relion_helix_toolbox --impose --i {large_map} "
+                        f"srun -c 100 -p {shlex.quote(partition)} relion_helix_toolbox --impose --i {large_map} "
                         f"--o {expanded_map} {common_args}")
 
         if 'app' in globals() and app:
@@ -4663,6 +4900,7 @@ def open_input_window_symmetry():
     # Expand Map Feature Button
     expand_map_btn = QPushButton("Expand map")
     expand_map_btn.clicked.connect(lambda: submit_inputs("ExpandMap"))
+    bind_partition_menu(expand_map_btn, lambda: submit_inputs("ExpandMap", force_partition=True))
     layout.addWidget(expand_map_btn, 18, 2)
     large_map_widgets.append(expand_map_btn)
 
