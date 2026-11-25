@@ -749,6 +749,7 @@ class MainWindow(QMainWindow):
         
         # --- RELION Export State ---
         self.current_mrcs_path = None
+        self.current_canvas_path = None
         self.current_model_star = None
         self.current_data_star = None
         self.total_classes = 0
@@ -812,7 +813,7 @@ class MainWindow(QMainWindow):
         row2.addWidget(self.btn_auto_group)
         
         self.btn_save_canvas = QPushButton("Save Canvas")
-        self.btn_save_canvas.setToolTip("Save the current canvas layout and stock to a JSON file")
+        self.btn_save_canvas.setToolTip("Save each tile's position, rotation angle and stacking order to JSON")
         self.btn_save_canvas.clicked.connect(self.save_canvas)
         row2.addWidget(self.btn_save_canvas)
         
@@ -959,13 +960,13 @@ class MainWindow(QMainWindow):
         for i, group in enumerate(groups):
             seen_ids = set()
             row_ids = []
-            for item in group:
+            for item in sorted(group, key=lambda tile: get_visual_center(tile).x()):
                 if item.tile_id not in seen_ids:
                     row_ids.append(item.tile_id)
                     seen_ids.add(item.tile_id)
             
             for tid in row_ids:
-                text_lines.append(f"Class {tid}")
+                text_lines.append(f"Class {self.relion_class_mapping.get(tid, tid)}")
             
             if i < len(groups) - 1:
                 text_lines.append("=======")
@@ -1103,6 +1104,7 @@ class MainWindow(QMainWindow):
 
     def load_mrcs(self, path, sort_metric='_rlnClassDistribution', reverse_sort=True, cols=5):
         self.current_mrcs_path = path
+        self.current_canvas_path = None
         self.current_voxel_size = 1.0
         try:
             with mrcfile.open(path, permissive=True) as mrc:
@@ -1446,20 +1448,25 @@ class MainWindow(QMainWindow):
         items = [i for i in self.scene.items() if isinstance(i, CanvasTileItem)]
         canvas_data = []
         for item in items:
-            canvas_data.append({
+            placement = {
                 "tile_id": item.tile_id,
                 "x": item.pos().x(),
                 "y": item.pos().y(),
+                "rotation": item.rotation(),
                 "z": item.zValue()
-            })
+            }
+            if item.tile_id in self.relion_class_mapping:
+                placement["relion_class_id"] = self.relion_class_mapping[item.tile_id]
+            canvas_data.append(placement)
             
         save_data = {
             "mrcs_path": self.current_mrcs_path,
+            "rotation_convention": {"unit": "degrees", "positive": "clockwise", "pivot": "tile_center"},
             "canvas": canvas_data
         }
         
         save_dir = os.path.dirname(self.current_mrcs_path)
-        save_path = os.path.join(save_dir, "xcop_canvas.json")
+        save_path = self.current_canvas_path or os.path.join(save_dir, "xcop_canvas.json")
         
         try:
             with open(save_path, 'w') as f:
@@ -1474,12 +1481,16 @@ class MainWindow(QMainWindow):
                 data = json.load(f)
                 
             mrcs_path = data.get("mrcs_path")
-            
-            # Robust path resolution: try absolute first, then relative to the json file
-            # This ensures portability if you move the folder from HPC to your laptop
-            if not mrcs_path or not os.path.exists(mrcs_path):
-                local_mrcs = os.path.join(os.path.dirname(json_path), os.path.basename(mrcs_path) if mrcs_path else "")
-                if os.path.exists(local_mrcs):
+            canvas_dir = os.path.dirname(os.path.abspath(json_path))
+            if mrcs_path and not os.path.isabs(mrcs_path):
+                sibling_path = os.path.join(canvas_dir, mrcs_path)
+                if os.path.isfile(sibling_path):
+                    mrcs_path = sibling_path
+
+            if not mrcs_path or not os.path.isfile(mrcs_path):
+                basename = os.path.basename((mrcs_path or "").replace("\\", "/"))
+                local_mrcs = os.path.join(canvas_dir, basename)
+                if os.path.isfile(local_mrcs):
                     mrcs_path = local_mrcs
                 else:
                     QMessageBox.warning(self, "Load Error", f"Cannot find the original MRCS file:\n{mrcs_path}\nMake sure the .mrcs is in the same folder as the json file.")
@@ -1496,18 +1507,25 @@ class MainWindow(QMainWindow):
             
             # Restore the canvas layout
             canvas_items = data.get("canvas", [])
+            tiles_by_class = {cid: tid for tid, cid in self.relion_class_mapping.items()}
             for item_data in canvas_items:
-                tile_id = item_data["tile_id"]
+                tile_id = (tiles_by_class.get(item_data["relion_class_id"])
+                           if "relion_class_id" in item_data else item_data["tile_id"])
                 if tile_id in self.tile_data:
                     pixmap = self.tile_data[tile_id]
                     item = CanvasTileItem(pixmap, tile_id, self.comms)
                     item.setPos(item_data["x"], item_data["y"])
+                    item.setRotation(item_data.get("rotation", 0.0))
                     item.setZValue(item_data.get("z", 0))
                     self.scene.addItem(item)
                     self.comms.stock_used.emit(tile_id)
                     
+            self.current_canvas_path = json_path
             self.scene.update()
             self.update_stats_ui()
+            bounds = self.scene.itemsBoundingRect()
+            if not bounds.isEmpty():
+                self.view.fitInView(bounds.adjusted(-12, -12, 12, 12), Qt.AspectRatioMode.KeepAspectRatio)
             
         except Exception as e:
             QMessageBox.critical(self, "Load Error", f"Failed to load canvas state:\n{str(e)}")
@@ -1706,6 +1724,7 @@ class MainWindow(QMainWindow):
         self.scene.clear()
         self.update_stats_ui()
         self.current_mrcs_path = None
+        self.current_canvas_path = None
         self.current_model_star = None
         self.current_data_star = None
         self.total_classes = 0

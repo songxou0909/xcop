@@ -17,7 +17,7 @@
       "preserve": [
         "shebang"
       ],
-      "sha256": "450034021bd8a8580e224ce1cd5b17a478014e997ff2d4eee9d6830ca65c2f03"
+      "sha256": "ea3d58b2e8bc8fc63a534174f0f8150afe30a98534d7fe92da9e8f9cd5af36a1"
     },
     {
       "path": "xcop_savings/atom2svg.py",
